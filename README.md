@@ -92,6 +92,29 @@ The manual steps above still work and remain the documented fallback (e.g.
 for an out-of-band emergency fix, or if the workflow is ever disabled) — the
 workflow is just automation of the exact same procedure.
 
+## GitHub Releases (added 2026-09-13)
+
+This repo's main distribution channel is still the raw file URLs on `main`
+(see above) - that is what the launcher actually fetches, and it has no
+notion of versions/tags. Separately, though,
+`.github/workflows/sync-host-service.yml` also publishes a human-facing
+GitHub Release whose tag mirrors whichever tag on the private
+`Anro-Lab/llm-management` repo currently points at the `msi` branch's
+HEAD commit (e.g. source `msi` HEAD == source tag `v0.12.12` => a Release
+here named `v0.12.12`, with `windows_host_service.py`,
+`windows_host_service.py.sig`, `linux_host_service.py`, and
+`linux_host_service.py.sig` attached as downloadable assets).
+
+- If `msi`'s HEAD commit does not exactly match a tag in the source repo
+  (an untagged commit landed there), the Release step is skipped for that
+  run - the Release simply stays at whatever version it last reached until
+  a tagged source commit shows up on `msi`. The raw-file mirror on `main`
+  is unaffected either way.
+- Re-running the workflow when the matching Release already exists is a
+  no-op (it does not recreate/re-upload existing assets).
+- These Releases are a convenience download surface only; nothing in this
+  repo or the launcher reads from them.
+
 ## Line endings
 
 `.gitattributes` forces LF for everything in this repo. Both mirrored `.py`
