@@ -1,12 +1,14 @@
 # llm-management-dist
 
-Public mirror of two operational scripts from the private `Anro-Lab/llm-management`
-repo (`scripts/`, `msi` branch):
+Public mirror of two files from the private `Anro-Lab/llm-management` repo
+(`scripts/`, `msi` branch):
 
-- `scripts/start_windows_host_service.ps1`
-- `scripts/install_linux_host_service.sh`
+- `scripts/windows_host_service.py`
+- `scripts/linux_host_service.py`
 
 This repo intentionally keeps only the current latest copy of each file (no
 version history/tags) — every sync overwrites in place. It exists so these
-scripts can be fetched anonymously (the source repo is private and cannot be
-read by an unauthenticated request).
+files can be fetched anonymously by installers/launchers at install time
+(the source repo is private and cannot be read by an unauthenticated
+request; these two files are the ones that must be fetchable without a
+token).
