@@ -11,6 +11,18 @@ name: Sync host service scripts
 # install, but a good run here is how a fixed/updated host service script
 # actually reaches end users without waiting for a new launcher build.
 #
+# Each run also publishes/keeps up to date a GitHub Release on THIS repo
+# whose tag mirrors whatever tag on Anro-Lab/llm-management currently
+# points at the `msi` branch's HEAD commit (e.g. msi HEAD == tag v0.12.12
+# there => Release "v0.12.12" here, with the four scripts/sigs as assets).
+# This is purely a convenience download surface for humans; it is NOT what
+# the launcher or the sync logic itself reads from - that's still the raw
+# file URLs on `main`. If msi's HEAD doesn't exactly match any tag in the
+# source repo (e.g. an untagged commit was pushed there), the release step
+# is skipped for that run and only the raw-file mirror on `main` is
+# updated - the Release then simply stays at whatever version it last was
+# until a tagged commit reaches `msi`.
+#
 # Required repo secrets (Settings -> Secrets and variables -> Actions):
 #   SOURCE_REPO_TOKEN      - PAT with read access to the private
 #                             Anro-Lab/llm-management repo's contents
@@ -143,3 +155,42 @@ jobs:
                   scripts/linux_host_service.py scripts/linux_host_service.py.sig
           git commit -m "sync: update host service scripts + signatures (auto-sync $(date -u +%F))"
           git push origin HEAD:main
+
+      - name: Determine matching source tag
+        id: srctag
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api repos/Anro-Lab/llm-management/commits/msi --jq '.sha')
+          tag=$(gh api repos/Anro-Lab/llm-management/tags --paginate --jq '.[] | select(.commit.sha=="'"$sha"'") | .name' | head -n1)
+          if [ -z "$tag" ]; then
+            echo "::warning::msi HEAD (${sha}) has no exactly-matching tag in Anro-Lab/llm-management - skipping Release publish this run (raw-file mirror on main was still updated above if anything changed)."
+          else
+            echo "Matched source tag: $tag (source commit $sha)"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release for this version
+        if: steps.srctag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.srctag.outputs.tag }}"
+          repo="${{ github.repository }}"
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            if [ -z "${{ steps.diff.outputs.changed }}" ]; then
+              echo "Release $tag already exists here and scripts did not change this run - nothing to do."
+              exit 0
+            fi
+            echo "Release $tag already exists but scripts changed this run - replacing its assets."
+            gh release delete "$tag" --repo "$repo" --yes --cleanup-tag
+          fi
+          gh release create "$tag" \
+            scripts/windows_host_service.py scripts/windows_host_service.py.sig \
+            scripts/linux_host_service.py scripts/linux_host_service.py.sig \
+            --repo "$repo" \
+            --target main \
+            --title "$tag" \
+            --notes "Mirrors Anro-Lab/llm-management's \`msi\` branch as of tag \`$tag\`. Auto-published by sync-host-service.yml - not the primary distribution channel (see README), just a convenience download snapshot."
