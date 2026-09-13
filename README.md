@@ -7,10 +7,6 @@ repo's `msi` branch:
 - `scripts/windows_host_service.py`
 - `scripts/linux_host_service.py`
 
-(This repo has no `msi` branch of its own — `msi` above names the *source*
-repo's branch the files are synced from. The files live in this repo at the
-same relative path, on this repo's own default branch, `main`.)
-
 This repo intentionally keeps only the current latest copy of each file (no
 version history/tags) — every sync overwrites in place. It exists so these
 files can be fetched anonymously by installers/launchers at install time
