@@ -1,0 +1,145 @@
+name: Sync host service scripts
+
+# Keeps this repo's scripts/windows_host_service.py and
+# scripts/linux_host_service.py mirroring the private
+# Anro-Lab/llm-management repo's `msi` branch, re-signing each with the
+# ed25519 signing key whenever their content changes. AnroMark-Launcher
+# (Anro-Lab/AnroMark-Launcher, internal/repair/host_service.go) fetches
+# these files + their .sig unauthenticated from this repo's `main` branch
+# at install time and falls back to its own embedded copy if the fetch or
+# signature check fails - so a broken/stale run here is never fatal to an
+# install, but a good run here is how a fixed/updated host service script
+# actually reaches end users without waiting for a new launcher build.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   SOURCE_REPO_TOKEN      - PAT with read access to the private
+#                             Anro-Lab/llm-management repo's contents
+#                             (fine-grained PAT, Contents: Read-only,
+#                             repository access limited to that one repo,
+#                             is enough).
+#   HOST_SERVICE_SIGNING_KEY - base64-encoded 32-byte ed25519 private key
+#                             seed (single line, no PEM/SSH wrapping) -
+#                             the SAME key already used for local manual
+#                             signing (see README.md). Never log or echo
+#                             this value; it only ever touches a 0600 temp
+#                             file within a single job run and is removed
+#                             before the job ends.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-host-service
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout llm-management-dist
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Fetch latest scripts from private source repo (msi branch)
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_REPO_TOKEN:-}" ]; then
+            echo "::error::SOURCE_REPO_TOKEN secret is not set - cannot read the private source repo. See workflow file header for setup instructions."
+            exit 1
+          fi
+          mkdir -p /tmp/priv
+          for f in windows_host_service.py linux_host_service.py; do
+            curl -sSf \
+              -H "Authorization: token ${SOURCE_REPO_TOKEN}" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/Anro-Lab/llm-management/contents/scripts/${f}?ref=msi" \
+              -o "/tmp/priv/${f}"
+            sz=$(wc -c < "/tmp/priv/${f}")
+            if [ "$sz" -lt 100 ]; then
+              echo "::error::fetched ${f} is suspiciously small (${sz} bytes) - probably an auth/error response, aborting without touching anything"
+              exit 1
+            fi
+          done
+
+      - name: Detect changes
+        id: diff
+        run: |
+          set -euo pipefail
+          changed=""
+          for f in windows_host_service.py linux_host_service.py; do
+            if ! cmp -s "/tmp/priv/${f}" "scripts/${f}"; then
+              changed="${changed} ${f}"
+            fi
+          done
+          changed="$(echo "$changed" | xargs)"
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          if [ -z "$changed" ]; then
+            echo "No changes - scripts already up to date with the private repo."
+          else
+            echo "Changed: $changed"
+          fi
+
+      - name: Copy changed files into working tree
+        if: steps.diff.outputs.changed != ''
+        run: |
+          set -euo pipefail
+          for f in ${{ steps.diff.outputs.changed }}; do
+            cp "/tmp/priv/${f}" "scripts/${f}"
+          done
+
+      - name: Write signing key to a temp file
+        if: steps.diff.outputs.changed != ''
+        env:
+          HOST_SERVICE_SIGNING_KEY: ${{ secrets.HOST_SERVICE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOST_SERVICE_SIGNING_KEY:-}" ]; then
+            echo "::error::HOST_SERVICE_SIGNING_KEY secret is not set - cannot sign the updated scripts. See workflow file header for setup instructions."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "${HOST_SERVICE_SIGNING_KEY}" > /tmp/signing.key
+
+      - name: Re-sign changed files
+        if: steps.diff.outputs.changed != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in ${{ steps.diff.outputs.changed }}; do
+            pwsh -File scripts/sign-host-service.ps1 -File "scripts/${f}" -PrivateKeyPath /tmp/signing.key
+          done
+
+      - name: Verify signatures against the embedded public key
+        if: steps.diff.outputs.changed != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in ${{ steps.diff.outputs.changed }}; do
+            pwsh -File scripts/verify-host-service.ps1 -File "scripts/${f}"
+          done
+
+      - name: Remove signing key material
+        if: always()
+        run: rm -f /tmp/signing.key
+
+      - name: Commit and push
+        if: steps.diff.outputs.changed != ''
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/windows_host_service.py scripts/windows_host_service.py.sig \
+                  scripts/linux_host_service.py scripts/linux_host_service.py.sig
+          git commit -m "sync: update host service scripts + signatures (auto-sync $(date -u +%F))"
+          git push origin HEAD:main

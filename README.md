@@ -63,3 +63,40 @@ A push of an updated `.py` file **without** re-signing it will make the
 launcher's fetch fail signature verification and silently fall back to its
 (older) embedded copy — the sync will have no effect on end users until the
 `.sig` is fixed.
+
+## Automated sync (added 2026-09-13)
+
+`.github/workflows/sync-host-service.yml` runs on a schedule (every 6 hours)
+and on manual `workflow_dispatch`. Each run: fetches the current
+`scripts/windows_host_service.py` / `scripts/linux_host_service.py` from the
+private source repo's `msi` branch via the GitHub Contents API, compares
+them byte-for-byte against what's currently committed here, and — only if
+something actually changed — copies the new content in, re-signs it with
+`scripts/sign-host-service.ps1`, verifies the result with
+`scripts/verify-host-service.ps1` (same check the launcher itself performs),
+and commits + pushes to `main`. A run where nothing changed does nothing
+(no empty commits).
+
+Required repo secrets (**Settings → Secrets and variables → Actions**):
+
+- `SOURCE_REPO_TOKEN` — a PAT that can read `Anro-Lab/llm-management`'s
+  contents. A fine-grained PAT scoped to just that one repo with
+  **Contents: Read-only** is sufficient and is the recommended choice over a
+  broad classic PAT.
+- `HOST_SERVICE_SIGNING_KEY` — the same base64 ed25519 private key seed used
+  for local manual signing (see above). It only ever touches a `0600` temp
+  file for the duration of a single job run and is deleted before the job
+  ends; it is never logged or echoed.
+
+The manual steps above still work and remain the documented fallback (e.g.
+for an out-of-band emergency fix, or if the workflow is ever disabled) — the
+workflow is just automation of the exact same procedure.
+
+## Line endings
+
+`.gitattributes` forces LF for everything in this repo. Both mirrored `.py`
+files are signed as committed here; a client with Windows `git`'s common
+`core.autocrlf=true` default checking this repo out **without**
+`.gitattributes` would silently rewrite them to CRLF on checkout, which
+changes their bytes and breaks the signature check on next re-sign/re-push
+from that checkout. Do not remove `.gitattributes`.
