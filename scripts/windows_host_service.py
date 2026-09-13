@@ -32,7 +32,7 @@ except ImportError:
     sys.exit(1)
 
 # Keep in sync with src/__init__.py
-__version__ = "0.12.12"
+__version__ = "1.0.0"
 
 app = FastAPI(
     title="Windows Host System Info Service",
