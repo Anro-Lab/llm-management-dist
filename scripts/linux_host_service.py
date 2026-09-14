@@ -41,8 +41,8 @@ except ImportError:
     print("ERROR: psutil is required: pip install psutil")
     sys.exit(1)
 
-# Keep in sync with src/__init__.py
-__version__ = "1.0.0"
+# Host-service version. Not required to match the llm-management image.
+__version__ = "1.0.2"
 
 app = FastAPI(
     title="Linux Host System Info Service",
@@ -52,35 +52,75 @@ app = FastAPI(
 
 _cache: Dict[str, Tuple[Any, float]] = {}
 _cache_lock = Lock()
+_cpu_sample_lock = Lock()
 _cache_ttl = {
     "gpu_usage": 2.0,
     "npu_usage": 2.0,
     "gpu_info": 30.0,
     "npu_info": 30.0,
     "memory_info": 30.0,
-    "storage_info": 5.0,
+    "storage_info": 30.0,
     "chassis_info": 300.0,
     "power_info": 30.0,
 }
+# Usage refresh only while a metrics client is active. Do not keep nvidia-smi
+# / lspci running because /health is polled. npu_usage is not here: Linux has
+# no stable counter, and refreshing it re-ran lspci via _get_npu_info().
 _refresh_intervals = {
     "gpu_usage": 1.5,
-    "npu_usage": 1.5,
 }
+_METRICS_CLIENT_WINDOW_SEC = 30.0
+_last_metrics_client = 0.0
+_app_loop: Optional[asyncio.AbstractEventLoop] = None
 _refresh_tasks: Dict[str, Any] = {}
 _refresh_last_time: Dict[str, float] = {}
 
 
+def _touch_metrics_client() -> None:
+    """Metrics routes only. /health and /api/version must not keep the sampler hot."""
+    global _last_metrics_client
+    _last_metrics_client = time.time()
+
+
+def _metrics_client_active() -> bool:
+    return (time.time() - _last_metrics_client) <= _METRICS_CLIENT_WINDOW_SEC
+
+
+async def _off_loop(func):
+    """Blocking psutil/subprocess work must not run on the Uvicorn loop."""
+    _touch_metrics_client()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, func)
+
+
 def _get_cached(key: str, func, *args, **kwargs):
     now = time.time()
+    schedule_refresh = False
     with _cache_lock:
         if key in _cache:
             value, timestamp = _cache[key]
             ttl = _cache_ttl.get(key, 1.0)
-            if now - timestamp < ttl:
-                refresh_interval = _refresh_intervals.get(key)
-                if refresh_interval and (now - _refresh_last_time.get(key, 0)) >= refresh_interval:
-                    _trigger_background_refresh(key, func, *args, **kwargs)
+            fresh = (now - timestamp) < ttl
+            if key in _refresh_intervals:
+                # Last snapshot, even if stale. Do not run nvidia-smi on this
+                # call to freshen it (TTD11 D8). Schedule outside the lock —
+                # this function is invoked from a worker thread.
+                schedule_refresh = _metrics_client_active() and (
+                    not fresh
+                    or (now - _refresh_last_time.get(key, 0))
+                    >= _refresh_intervals.get(key, 1.0)
+                )
+                cached = value
+            elif fresh:
                 return value
+            else:
+                cached = None
+        else:
+            cached = None
+    if cached is not None:
+        if schedule_refresh:
+            _trigger_background_refresh(key, func, *args, **kwargs)
+        return cached
     value = func(*args, **kwargs)
     with _cache_lock:
         _cache[key] = (value, now)
@@ -89,39 +129,61 @@ def _get_cached(key: str, func, *args, **kwargs):
 
 
 def _trigger_background_refresh(key: str, func, *args, **kwargs):
+    """Schedule a sampler tick on the app loop. Never sample in the caller."""
     now = time.time()
-    last_refresh = _refresh_last_time.get(key, 0)
     refresh_interval = _refresh_intervals.get(key)
-    if not refresh_interval or (now - last_refresh) < refresh_interval:
+    if not refresh_interval or (now - _refresh_last_time.get(key, 0)) < refresh_interval:
+        return
+    if not _metrics_client_active():
+        return
+    loop = _app_loop
+    if loop is None or loop.is_closed():
         return
     if key in _refresh_tasks and not _refresh_tasks[key].done():
         return
 
     async def refresh_task():
         try:
-            loop = asyncio.get_running_loop()
-            value = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+            running = asyncio.get_running_loop()
+            value = await running.run_in_executor(None, lambda: func(*args, **kwargs))
             with _cache_lock:
                 _cache[key] = (value, time.time())
                 _refresh_last_time[key] = time.time()
         except Exception as e:
             print(f"WARNING: Background refresh failed for {key}: {e}", file=sys.stderr)
+        finally:
+            _refresh_tasks.pop(key, None)
+
+    def _schedule():
+        if key in _refresh_tasks and not _refresh_tasks[key].done():
+            return
+        _refresh_tasks[key] = loop.create_task(refresh_task())
 
     try:
-        loop = asyncio.get_running_loop()
+        running = asyncio.get_running_loop()
     except RuntimeError:
-        value = func(*args, **kwargs)
-        with _cache_lock:
-            _cache[key] = (value, time.time())
-            _refresh_last_time[key] = time.time()
-        return
-    _refresh_tasks[key] = loop.create_task(refresh_task())
+        running = None
+    if running is loop:
+        _schedule()
+    else:
+        loop.call_soon_threadsafe(_schedule)
 
 
 async def _background_refresh_loop():
+    loop = asyncio.get_running_loop()
+    # Prime the CPU delta. interval>0 here would block startup; interval=None
+    # only stores a baseline so the next read is not a sleep.
+    try:
+        await loop.run_in_executor(None, lambda: psutil.cpu_percent(interval=None))
+    except Exception as exc:
+        print(f"WARNING: CPU prime failed: {exc}", file=sys.stderr)
     while True:
         try:
             await asyncio.sleep(1.0)
+            # Idle stretch. /health does not set _last_metrics_client, so a
+            # watchdog must not keep nvidia-smi running.
+            if not _metrics_client_active():
+                continue
             now = time.time()
             with _cache_lock:
                 cache_keys = list(_cache.keys())
@@ -130,14 +192,30 @@ async def _background_refresh_loop():
                 if not refresh_interval:
                     continue
                 if (now - _refresh_last_time.get(key, 0)) >= refresh_interval:
-                    func_map = {
-                        "gpu_usage": _get_gpu_usage,
-                        "npu_usage": _get_npu_usage,
-                        "memory_info": _get_memory_info,
-                    }
-                    func = func_map.get(key)
-                    if func:
-                        _trigger_background_refresh(key, func)
+                    # Usage only. Never refresh memory_info (dmidecode) or
+                    # npu_usage (that path used to re-run lspci) on this tick.
+                    if key == "gpu_usage":
+                        _trigger_background_refresh(key, _get_gpu_usage)
+            # One identity tool per second, only while a dashboard is open.
+            # Bundle must not be the thing that runs dmidecode / lsblk / lspci.
+            if _metrics_client_active():
+                for key, func in (
+                    ("gpu_info", _get_gpu_info),
+                    ("npu_info", _get_npu_info),
+                    ("memory_info", _get_memory_info),
+                    ("storage_info", _get_storage_info),
+                    ("chassis_info", _get_chassis_info),
+                    ("power_info", _get_power_info),
+                ):
+                    with _cache_lock:
+                        item = _cache.get(key)
+                        fresh = item is not None and (now - item[1]) < _cache_ttl.get(key, 30.0)
+                    if fresh:
+                        continue
+                    value = await loop.run_in_executor(None, func)
+                    with _cache_lock:
+                        _cache[key] = (value, time.time())
+                    break
         except Exception as e:
             print(f"WARNING: Background refresh loop error: {e}", file=sys.stderr)
             await asyncio.sleep(5.0)
@@ -145,6 +223,8 @@ async def _background_refresh_loop():
 
 @app.on_event("startup")
 async def startup_event():
+    global _app_loop
+    _app_loop = asyncio.get_running_loop()
     try:
         _get_cached("gpu_info", _get_gpu_info)
         _get_cached("npu_info", _get_npu_info)
@@ -250,22 +330,25 @@ def _cpu_brand() -> str:
 
 
 def _get_cpu_usage() -> Dict[str, Any]:
-    # First call may return 0.0; brief interval improves accuracy.
-    util = psutil.cpu_percent(interval=0.2)
-    freq = 0
-    try:
-        f = psutil.cpu_freq()
-        if f and f.current:
-            freq = int(f.current)
-    except Exception:
-        pass
-    return {
-        "utilization": float(util),
-        "frequency": freq,
-        "physical_cores": int(psutil.cpu_count(logical=False) or 0),
-        "logical_cores": int(psutil.cpu_count(logical=True) or 0),
-        "brand": _cpu_brand(),
-    }
+    # interval=None is the delta since the prime / previous call. Never pass
+    # interval>0: this used to sleep 200ms on the Uvicorn event loop.
+    # One lock: parallel bundle + /cpu/usage must not split the same delta.
+    with _cpu_sample_lock:
+        util = float(psutil.cpu_percent(interval=None) or 0.0)
+        freq = 0
+        try:
+            f = psutil.cpu_freq()
+            if f and f.current:
+                freq = int(f.current)
+        except Exception:
+            pass
+        return {
+            "utilization": util,
+            "frequency": freq,
+            "physical_cores": int(psutil.cpu_count(logical=False) or 0),
+            "logical_cores": int(psutil.cpu_count(logical=True) or 0),
+            "brand": _cpu_brand(),
+        }
 
 
 def _read_dmi_id(key: str) -> Optional[str]:
@@ -633,8 +716,11 @@ def _get_gpu_usage() -> Dict[str, Any]:
     if rows:
         return {"gpus": rows}
 
-    # Catalog-only AMD: return 0% util with known names
-    info = _get_gpu_info()
+    # Cached identity only. Do not call _get_gpu_info() here — that runs
+    # nvidia-smi / rocm-smi / lspci and used to fire on the usage refresh.
+    with _cache_lock:
+        cached = _cache.get("gpu_info")
+    info = cached[0] if cached else {"all_gpus": []}
     cleaned = []
     for g in info.get("all_gpus") or []:
         name = g.get("gpu_model", "Unknown GPU")
@@ -705,10 +791,15 @@ def _get_npu_info() -> Dict[str, Any]:
 
 
 def _get_npu_usage() -> Dict[str, Any]:
-    info = _get_npu_info()
-    model = info.get("npu_model") if info else None
-    # Linux rarely exposes a stable public counter; return 0 when present.
-    return {"npu_utilization": 0.0, "npu_model": model}
+    # No stable Linux NPU busy counter. Return a number, never null, and do
+    # not call _get_npu_info() (lspci) from the usage tick.
+    with _cache_lock:
+        cached = _cache.get("npu_info")
+    info = cached[0] if cached else {}
+    return {
+        "npu_utilization": 0.0,
+        "npu_model": (info or {}).get("npu_model"),
+    }
 
 
 def _get_os_info() -> Dict[str, Any]:
@@ -735,32 +826,32 @@ async def get_version():
 
 @app.get("/api/cpu/usage")
 async def get_cpu_usage():
-    return _get_cpu_usage()
+    return await _off_loop(_get_cpu_usage)
 
 
 @app.get("/api/gpu")
 async def get_gpu():
-    return _get_cached("gpu_info", _get_gpu_info)
+    return await _off_loop(lambda: _get_cached("gpu_info", _get_gpu_info))
 
 
 @app.get("/api/gpu/usage")
 async def get_gpu_usage():
-    return _get_cached("gpu_usage", _get_gpu_usage)
+    return await _off_loop(lambda: _get_cached("gpu_usage", _get_gpu_usage))
 
 
 @app.get("/api/npu")
 async def get_npu():
-    return _get_cached("npu_info", _get_npu_info)
+    return await _off_loop(lambda: _get_cached("npu_info", _get_npu_info))
 
 
 @app.get("/api/npu/usage")
 async def get_npu_usage():
-    return _get_cached("npu_usage", _get_npu_usage)
+    return await _off_loop(lambda: _get_cached("npu_usage", _get_npu_usage))
 
 
 @app.get("/api/memory")
 async def get_memory():
-    return _get_cached("memory_info", _get_memory_info)
+    return await _off_loop(lambda: _get_cached("memory_info", _get_memory_info))
 
 
 @app.get("/api/chassis")
@@ -781,97 +872,137 @@ async def get_power():
 
 @app.get("/api/memory/usage")
 async def get_memory_usage():
-    return _get_memory_usage()
+    return await _off_loop(_get_memory_usage)
 
 
 @app.get("/api/storage")
 async def get_storage():
-    return _get_cached("storage_info", _get_storage_info)
+    return await _off_loop(lambda: _get_cached("storage_info", _get_storage_info))
+
+
+def _cached_identity(key: str, default: Any) -> Any:
+    """Last identity only. Never computes (that would spawn dmidecode / lspci)."""
+    with _cache_lock:
+        item = _cache.get(key)
+    if item is None:
+        return default
+    return item[0]
+
+
+def _memory_info_view() -> Dict[str, Any]:
+    """RAM size from psutil. Type/speed stay on the identity cache (dmidecode)."""
+    info = _cached_identity("memory_info", None)
+    if isinstance(info, dict) and info.get("ram_size"):
+        return info
+    vm = psutil.virtual_memory()
+    base = dict(info) if isinstance(info, dict) else {}
+    base.setdefault("ram_size", round(vm.total / (1024**3), 2))
+    base.setdefault("ram_type", "Unknown")
+    base.setdefault("ram_speed", 0)
+    base.setdefault("module_count", 0)
+    base.setdefault("data_width_bits", 64)
+    return base
+
+
+def _storage_view() -> Dict[str, Any]:
+    """Live free/size from psutil. Media type from identity. No lsblk on this path."""
+    info = _cached_identity("storage_info", {}) or {}
+    size = info.get("storage_size") or 0
+    free = info.get("storage_free") or 0
+    try:
+        usage = psutil.disk_usage("/")
+        size = round(usage.total / (1024**3), 2)
+        free = round(usage.free / (1024**3), 2)
+    except Exception:
+        pass
+    return {
+        "storage_size": size,
+        "storage_free": free,
+        "storage_type": info.get("storage_type") or "Unknown",
+    }
+
+
+def _specs_from_usage(gpu_usage, npu_usage, os_info, brand: Optional[str] = None) -> Dict[str, Any]:
+    """Last identity plus current usage. A tool miss must not delay usage fields."""
+    gpu_info = _cached_identity("gpu_info", {"all_gpus": []})
+    npu_info = _cached_identity("npu_info", {})
+    gpu_usage, npu_usage = _attach_identity_to_usage(
+        gpu_usage, gpu_info, npu_usage, npu_info
+    )
+    return {
+        "gpu_info": gpu_info,
+        "gpu_usage": gpu_usage,
+        "npu_info": npu_info,
+        "npu_usage": npu_usage,
+        "memory_info": _memory_info_view(),
+        "storage_info": _storage_view(),
+        "os_info": os_info,
+        "cpu_info": {"brand": brand or _cpu_brand()},
+        "chassis_info": _cached_identity("chassis_info", {}),
+        "power_info": _cached_identity("power_info", {}),
+    }
+
+
+def _attach_identity_to_usage(gpu_usage, gpu_info, npu_usage, npu_info):
+    """Fill names from identity already fetched. Do not re-query tools."""
+    usage = gpu_usage if isinstance(gpu_usage, dict) else {"gpus": []}
+    if not usage.get("gpus") and isinstance(gpu_info, dict) and gpu_info.get("all_gpus"):
+        cleaned = []
+        for g in gpu_info.get("all_gpus") or []:
+            name = g.get("gpu_model", "Unknown GPU")
+            if _is_phantom_gpu_name(name):
+                continue
+            vram_gb = float(g.get("gpu_dedicated_vram") or 0)
+            cleaned.append(
+                {
+                    "name": name,
+                    "utilization": 0.0,
+                    "memory_used_mb": 0.0,
+                    "memory_total_mb": round(vram_gb * 1024, 2),
+                    "vendor": _infer_vendor(name),
+                }
+            )
+        if cleaned:
+            usage = {"gpus": cleaned}
+    npu = dict(npu_usage or {})
+    if npu.get("npu_utilization") is None:
+        npu["npu_utilization"] = 0.0
+    if not npu.get("npu_model") and isinstance(npu_info, dict):
+        npu["npu_model"] = npu_info.get("npu_model")
+    return usage, npu
 
 
 @app.get("/api/system-specs")
 async def get_system_specs():
+    """Last identity plus usage snapshot. Does not run dmidecode / lspci / lsblk."""
+    _touch_metrics_client()
     loop = asyncio.get_running_loop()
-    (
-        gpu_info,
-        gpu_usage,
-        npu_info,
-        npu_usage,
-        memory_info,
-        storage_info,
-        os_info,
-        chassis_info,
-        power_info,
-    ) = await asyncio.gather(
-        loop.run_in_executor(None, lambda: _get_cached("gpu_info", _get_gpu_info)),
+    gpu_usage, os_info = await asyncio.gather(
         loop.run_in_executor(None, lambda: _get_cached("gpu_usage", _get_gpu_usage)),
-        loop.run_in_executor(None, lambda: _get_cached("npu_info", _get_npu_info)),
-        loop.run_in_executor(None, lambda: _get_cached("npu_usage", _get_npu_usage)),
-        loop.run_in_executor(None, lambda: _get_cached("memory_info", _get_memory_info)),
-        loop.run_in_executor(None, lambda: _get_cached("storage_info", _get_storage_info)),
         loop.run_in_executor(None, _get_os_info),
-        loop.run_in_executor(None, lambda: _get_cached("chassis_info", _get_chassis_info)),
-        loop.run_in_executor(None, lambda: _get_cached("power_info", _get_power_info)),
     )
-    return {
-        "gpu_info": gpu_info,
-        "gpu_usage": gpu_usage,
-        "npu_info": npu_info,
-        "npu_usage": npu_usage,
-        "memory_info": memory_info,
-        "storage_info": storage_info,
-        "os_info": os_info,
-        "cpu_info": {"brand": _cpu_brand()},
-        "chassis_info": chassis_info,
-        "power_info": power_info,
-    }
+    return _specs_from_usage(gpu_usage, _get_npu_usage(), os_info)
 
 
 @app.get("/api/metrics/bundle")
 async def get_metrics_bundle():
+    """Single round-trip. Copies usage and last identity. Does not scan the machine."""
+    _touch_metrics_client()
     loop = asyncio.get_running_loop()
-    (
-        cpu_usage,
-        memory_usage,
-        gpu_usage,
-        gpu_info,
-        npu_info,
-        npu_usage,
-        memory_info,
-        storage_info,
-        os_info,
-        chassis_info,
-        power_info,
-    ) = await asyncio.gather(
+    cpu_usage, memory_usage, gpu_usage, os_info = await asyncio.gather(
         loop.run_in_executor(None, _get_cpu_usage),
         loop.run_in_executor(None, _get_memory_usage),
         loop.run_in_executor(None, lambda: _get_cached("gpu_usage", _get_gpu_usage)),
-        loop.run_in_executor(None, lambda: _get_cached("gpu_info", _get_gpu_info)),
-        loop.run_in_executor(None, lambda: _get_cached("npu_info", _get_npu_info)),
-        loop.run_in_executor(None, lambda: _get_cached("npu_usage", _get_npu_usage)),
-        loop.run_in_executor(None, lambda: _get_cached("memory_info", _get_memory_info)),
-        loop.run_in_executor(None, lambda: _get_cached("storage_info", _get_storage_info)),
         loop.run_in_executor(None, _get_os_info),
-        loop.run_in_executor(None, lambda: _get_cached("chassis_info", _get_chassis_info)),
-        loop.run_in_executor(None, lambda: _get_cached("power_info", _get_power_info)),
     )
-    system_specs = {
-        "gpu_info": gpu_info,
-        "gpu_usage": gpu_usage,
-        "npu_info": npu_info,
-        "npu_usage": npu_usage,
-        "memory_info": memory_info,
-        "storage_info": storage_info,
-        "os_info": os_info,
-        "cpu_info": {"brand": cpu_usage.get("brand") or _cpu_brand()},
-        "chassis_info": chassis_info,
-        "power_info": power_info,
-    }
+    system_specs = _specs_from_usage(
+        gpu_usage, _get_npu_usage(), os_info, brand=cpu_usage.get("brand")
+    )
     return {
         "cpu_usage": cpu_usage,
         "memory_usage": memory_usage,
         "system_specs": system_specs,
-        "gpu_usage": gpu_usage,
+        "gpu_usage": system_specs["gpu_usage"],
     }
 
 

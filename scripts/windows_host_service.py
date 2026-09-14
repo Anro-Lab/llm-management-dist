@@ -15,12 +15,14 @@ import subprocess
 import re
 import os
 import time
+import copy
+import ctypes
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import argparse
 from functools import lru_cache
 import asyncio
-from threading import Lock
+from threading import Lock, Thread
 
 try:
     from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -31,8 +33,8 @@ except ImportError:
     print("  pip install fastapi uvicorn")
     sys.exit(1)
 
-# Keep in sync with src/__init__.py
-__version__ = "1.0.0"
+# Host-service version. Not required to match the llm-management image.
+__version__ = "1.0.2"
 
 app = FastAPI(
     title="Windows Host System Info Service",
@@ -40,24 +42,70 @@ app = FastAPI(
     version=__version__,
 )
 
-# Simple in-memory cache for expensive operations with background refresh
+# Identity cache only (CIM). Usage is the in-process sampler, not a cache in
+# front of powershell.exe. TTL >= 30s so a Dashboard tick never re-runs CIM.
 _cache = {}
 _cache_lock = Lock()
 _cache_ttl = {
-    'gpu_usage': 2.0,  # Cache GPU usage for 2 seconds
-    'npu_usage': 2.0,  # Cache NPU usage for 2 seconds
-    'gpu_info': 30.0,  # Cache GPU info for 30 seconds (rarely changes)
-    'npu_info': 30.0,  # Cache NPU info for 30 seconds (rarely changes)
-    'memory_info': 2.0,  # Cache memory info for 2 seconds
-    'storage_info': 5.0,  # Cache storage info for 5 seconds
+    'gpu_info': 30.0,
+    'npu_info': 30.0,
+    'memory_info': 30.0,
+    'storage_info': 30.0,
+    'chassis_info': 30.0,
+    'power_info': 30.0,
 }
-_refresh_intervals = {
-    'gpu_usage': 1.5,  # Refresh every 1.5 seconds in background
-    'npu_usage': 1.5,  # Refresh every 1.5 seconds in background
-    'memory_info': 1.5,  # Refresh every 1.5 seconds in background
+_refresh_intervals = {}
+_refresh_tasks = {}
+_refresh_last_time = {}
+
+_METRICS_CLIENT_WINDOW_SEC = 30.0
+_SAMPLER_HOT_SEC = 1.0
+_SAMPLER_IDLE_SEC = 10.0
+_last_metrics_client = 0.0
+_snapshot_lock = Lock()
+_snapshot: Dict[str, Any] = {
+    "cpu_usage": {
+        "utilization": 0.0,
+        "frequency": 0,
+        "physical_cores": 0,
+        "logical_cores": 0,
+    },
+    "memory_usage": {"total": 0, "used": 0, "available": 0},
+    "gpu_usage": {"gpus": []},
+    "npu_usage": {"npu_utilization": 0.0, "npu_model": None},
+    "storage_live": {"storage_free": 0.0, "storage_size_live": 0.0},
 }
-_refresh_tasks = {}  # Track background refresh tasks
-_refresh_last_time = {}  # Track last refresh time
+_cpu_cores: Dict[str, int] = {"physical": 0, "logical": 0}
+# Previous GetSystemTimes sample plus wall clock. Owned by the sampler only.
+# A short window (PDH open, a few hundred ms) reads as a spike vs Task Manager.
+_cpu_times_prev: Optional[Tuple[int, int, int, float]] = None
+_CPU_MIN_WINDOW_SEC = 0.8
+_pdh = None  # type: ignore
+_LUID_RE = re.compile(r"luid_0x([0-9a-f]+)_0x([0-9a-f]+)", re.I)
+_PHYS_RE = re.compile(r"phys_(\d+)", re.I)
+
+
+def _touch_metrics_client() -> None:
+    """Metrics routes only. /health and /api/version must not keep the sampler hot."""
+    global _last_metrics_client
+    _last_metrics_client = time.time()
+
+
+def _metrics_client_active() -> bool:
+    return (time.time() - _last_metrics_client) <= _METRICS_CLIENT_WINDOW_SEC
+
+
+def _copy_snapshot() -> Dict[str, Any]:
+    with _snapshot_lock:
+        return copy.deepcopy(_snapshot)
+
+
+def _cached_identity(key: str, default: Any) -> Any:
+    """Last identity only. Never computes (that would spawn powershell.exe)."""
+    with _cache_lock:
+        item = _cache.get(key)
+        value = item[0] if item else default
+    return copy.deepcopy(value)
 
 
 def _get_cached(key: str, func, *args, **kwargs):
@@ -69,11 +117,6 @@ def _get_cached(key: str, func, *args, **kwargs):
             value, timestamp = _cache[key]
             ttl = _cache_ttl.get(key, 1.0)
             if now - timestamp < ttl:
-                # Check if background refresh is needed
-                refresh_interval = _refresh_intervals.get(key)
-                if refresh_interval and (now - _refresh_last_time.get(key, 0)) >= refresh_interval:
-                    # Trigger background refresh (non-blocking)
-                    _trigger_background_refresh(key, func, *args, **kwargs)
                 return value
     
     # Compute new value (cache miss or expired)
@@ -84,88 +127,508 @@ def _get_cached(key: str, func, *args, **kwargs):
     return value
 
 
-def _trigger_background_refresh(key: str, func, *args, **kwargs):
-    """Trigger background refresh of cache entry."""
-    now = time.time()
-    last_refresh = _refresh_last_time.get(key, 0)
-    refresh_interval = _refresh_intervals.get(key)
-    
-    if not refresh_interval or (now - last_refresh) < refresh_interval:
-        return  # Too soon to refresh
-    
-    # Check if refresh task is already running
-    if key in _refresh_tasks and not _refresh_tasks[key].done():
-        return  # Refresh already in progress
-    
-    # Start background refresh task
-    async def refresh_task():
+def _infer_vendor(name: str) -> str:
+    low = (name or "").lower()
+    if any(x in low for x in ("nvidia", "geforce", "rtx", "gtx", "quadro", "tesla")):
+        return "NVIDIA"
+    if any(x in low for x in ("amd", "radeon", " rdna", "vega")) or "rx " in low or low.startswith("rx"):
+        return "AMD"
+    if any(x in low for x in ("intel", "arc", "iris", "uhd graphics")):
+        return "Intel"
+    return "Unknown"
+
+
+def _instance_name(counter_path: str) -> str:
+    match = re.search(r"\((.*)\)", counter_path)
+    return match.group(1) if match else counter_path
+
+
+def _luid_key(instance: str) -> Optional[str]:
+    match = _LUID_RE.search(instance or "")
+    if not match:
+        return None
+    return f"{match.group(1)}_{match.group(2)}".lower()
+
+
+def _phys_index(instance: str) -> Optional[int]:
+    match = _PHYS_RE.search(instance or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+class _PdhUsageQuery:
+    """One PDH query, opened once. Each tick calls CollectQueryData once.
+
+    Do not take two samples with a wait inside one collect. That is the
+    Get-Counter -MaxSamples 2 hang on GPU Engine(*).
+    """
+
+    def __init__(self) -> None:
+        self.query = None
+        self.counters: List[Tuple[str, str, Any]] = []
+        self._expanded = 0
+        self._last_expand = 0.0
+
+    def close(self) -> None:
+        if self.query is not None:
+            try:
+                import win32pdh
+                win32pdh.CloseQuery(self.query)
+            except Exception:
+                pass
+        self.query = None
+        self.counters = []
+
+    def open(self) -> None:
+        import win32pdh
+
+        self.close()
+        query = win32pdh.OpenQuery()
+        add = getattr(win32pdh, "AddEnglishCounter", win32pdh.AddCounter)
+        counters: List[Tuple[str, str, Any]] = []
+
+        def _add_wild(kind: str, pattern: str) -> int:
+            try:
+                paths = win32pdh.ExpandCounterPath(pattern) or []
+            except Exception:
+                return 0
+            added = 0
+            for path in paths:
+                try:
+                    counters.append((kind, path, add(query, path)))
+                    added += 1
+                except Exception:
+                    continue
+            return added
+
+        gpu_n = _add_wild("util", r"\GPU Engine(*)\Utilization Percentage")
+        ded_n = _add_wild("ded", r"\GPU Adapter Memory(*)\Dedicated Usage")
+        shr_n = _add_wild("shr", r"\GPU Adapter Memory(*)\Shared Usage")
+        if ded_n == 0 and shr_n == 0:
+            # Process counters are per PID; sum them. Adapter counters are one
+            # value per GPU and stay a max (kind ded/shr).
+            _add_wild("ded_sum", r"\GPU Process Memory(*)\Dedicated Usage")
+            _add_wild("shr_sum", r"\GPU Process Memory(*)\Shared Usage")
+        npu_n = 0
+        for pattern in (
+            r"\NPU Engine(*)\Utilization Percentage",
+            r"\AMD XDNA Engine(*)\Utilization Percentage",
+            r"\Compute Accelerator(*)\Utilization Percentage",
+            r"\NPU(*)\Utilization Percentage",
+        ):
+            npu_n += _add_wild("npu", pattern)
+        self.query = query
+        self.counters = counters
+        self._expanded = gpu_n + ded_n + shr_n + npu_n
+        self._last_expand = time.time()
         try:
-            # Run in executor to avoid blocking
-            loop = asyncio.get_event_loop()
-            value = await loop.run_in_executor(None, func, *args, **kwargs)
-            with _cache_lock:
-                _cache[key] = (value, time.time())
-                _refresh_last_time[key] = time.time()
-        except Exception as e:
-            # Log error but don't fail - use stale cache
-            print(f"WARNING: Background refresh failed for {key}: {e}", file=sys.stderr)
-    
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        task = asyncio.create_task(refresh_task())
-        _refresh_tasks[key] = task
+            win32pdh.CollectQueryData(query)
+        except Exception as exc:
+            print(f"WARNING: PDH prime collect failed: {exc}", file=sys.stderr)
+
+    def maybe_reopen(self) -> None:
+        """Rebuild only if the wildcard set changed, and not more than every 30s."""
+        if self.query is None or (time.time() - self._last_expand) < 30.0:
+            return
+        try:
+            import win32pdh
+            eng = win32pdh.ExpandCounterPath(r"\GPU Engine(*)\Utilization Percentage") or []
+        except Exception:
+            return
+        if len(eng) != sum(1 for kind, _p, _h in self.counters if kind == "util"):
+            try:
+                self.open()
+            except Exception as exc:
+                print(f"WARNING: PDH reopen failed: {exc}", file=sys.stderr)
+
+    def collect(self) -> List[Tuple[str, str, float]]:
+        import win32pdh
+
+        if self.query is None:
+            self.open()
+        win32pdh.CollectQueryData(self.query)
+        rows: List[Tuple[str, str, float]] = []
+        for kind, path, handle in self.counters:
+            try:
+                _typ, value = win32pdh.GetFormattedCounterValue(handle, win32pdh.PDH_FMT_DOUBLE)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            rows.append((kind, _instance_name(path), number))
+        return rows
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", ctypes.c_uint32),
+        ("dwHighDateTime", ctypes.c_uint32),
+    ]
+
+
+def _filetime_int(ft: _FILETIME) -> int:
+    return (int(ft.dwHighDateTime) << 32) | int(ft.dwLowDateTime)
+
+
+def _read_system_times() -> Tuple[int, int, int]:
+    """(idle, kernel, user). Kernel already includes idle. Same source as Task Manager overall %."""
+    idle, kernel, user = _FILETIME(), _FILETIME(), _FILETIME()
+    if not ctypes.windll.kernel32.GetSystemTimes(
+        ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+    ):
+        raise OSError("GetSystemTimes failed")
+    return (_filetime_int(idle), _filetime_int(kernel), _filetime_int(user))
+
+
+def _percent_from_system_times(
+    prev: Tuple[int, int, int], curr: Tuple[int, int, int], wall_sec: float = 1.0
+) -> Optional[float]:
+    """Busy time / elapsed, matching \\Processor(_Total)\\% Processor Time.
+
+    Not % Processor Utility (that tracks boost and runs hot vs Task Manager).
+    wall_sec must be a real tick (~1s). A setup slice is not a reading.
+    """
+    if wall_sec < _CPU_MIN_WINDOW_SEC:
+        return None
+    idle = curr[0] - prev[0]
+    kernel = curr[1] - prev[1]
+    user = curr[2] - prev[2]
+    if idle < 0 or kernel < 0 or user < 0:
+        return None
+    busy = (kernel - idle) + user
+    total = kernel + user
+    if total <= 0 or busy < 0:
+        return None
+    return 100.0 * busy / total
+
+
+def _clamp_percent(value: float) -> float:
+    number = float(value or 0.0)
+    if number < 0:
+        return 0.0
+    if number > 100:
+        return 100.0
+    return round(number, 1)
+
+
+def _sample_cpu_ram() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    import psutil
+
+    global _cpu_times_prev
+    util: Optional[float] = None
+    try:
+        now_times = _read_system_times()
+        now_wall = time.time()
+        if _cpu_times_prev is not None:
+            util = _percent_from_system_times(
+                _cpu_times_prev[:3], now_times, now_wall - _cpu_times_prev[3]
+            )
+        if util is not None:
+            _cpu_times_prev = (now_times[0], now_times[1], now_times[2], now_wall)
+    except OSError as exc:
+        print(f"WARNING: GetSystemTimes failed: {exc}", file=sys.stderr)
+    if util is None:
+        previous = _copy_snapshot()["cpu_usage"].get("utilization")
+        util = float(previous) if isinstance(previous, (int, float)) else 0.0
+    util = _clamp_percent(util)
+    freq = _cpu_cores.get("frequency", 0)
+    try:
+        info = psutil.cpu_freq()
+        if info and info.current:
+            freq = int(info.current)
+            _cpu_cores["frequency"] = freq
+    except Exception:
+        pass
+    if not _cpu_cores.get("logical"):
+        _cpu_cores["physical"] = int(psutil.cpu_count(logical=False) or 0)
+        _cpu_cores["logical"] = int(psutil.cpu_count(logical=True) or 0)
+    cpu = {
+        "utilization": util,
+        "frequency": int(freq or 0),
+        "physical_cores": int(_cpu_cores.get("physical") or 0),
+        "logical_cores": int(_cpu_cores.get("logical") or 0),
+    }
+    vm = psutil.virtual_memory()
+    mem = {
+        "total": int(vm.total),
+        "used": int(vm.used),
+        "available": int(vm.available),
+    }
+    return cpu, mem
+
+
+def _sample_disk() -> Dict[str, float]:
+    import psutil
+
+    usage = psutil.disk_usage("C:\\")
+    return {
+        "storage_free": round(usage.free / (1024**3), 2),
+        "storage_size_live": round(usage.total / (1024**3), 2),
+    }
+
+
+def _join_gpu_usage(identity_gpus: List[Dict[str, Any]], samples: List[Tuple[str, str, float]]) -> Dict[str, Any]:
+    """Match PDH samples to cached identity. No CIM. Utilization is always a number."""
+    util_map: Dict[str, float] = {}
+    ded_map: Dict[str, float] = {}
+    shr_map: Dict[str, float] = {}
+
+    def _bump(store: Dict[str, float], key: Optional[str], value: float, sum_values: bool = False) -> None:
+        if not key:
+            return
+        if sum_values:
+            store[key] = store.get(key, 0.0) + value
+        elif value > store.get(key, 0.0):
+            store[key] = value
+
+    for kind, instance, value in samples:
+        if kind == "npu":
+            continue
+        luid = _luid_key(instance)
+        phys = _phys_index(instance)
+        idx_key = f"idx_{phys}" if phys is not None else None
+        if kind == "util":
+            _bump(util_map, luid, value)
+            _bump(util_map, idx_key, value)
+            _bump(util_map, "global", value)
+        elif kind in ("ded", "ded_sum"):
+            _bump(ded_map, luid or idx_key, value, sum_values=kind == "ded_sum")
+        elif kind in ("shr", "shr_sum"):
+            _bump(shr_map, luid or idx_key, value, sum_values=kind == "shr_sum")
+
+    def _mem_mb(key: str) -> Optional[float]:
+        if key not in ded_map and key not in shr_map:
+            return None
+        return round((ded_map.get(key, 0.0) + shr_map.get(key, 0.0)) / (1024**2), 2)
+
+    catalog = []
+    for gpu in identity_gpus or []:
+        name = gpu.get("gpu_model") or "Unknown GPU"
+        vram_gb = float(gpu.get("gpu_dedicated_vram") or 0)
+        catalog.append(
+            {
+                "name": name,
+                "memory_total_mb": round(vram_gb * 1024, 2),
+                "vendor": _infer_vendor(name),
+            }
+        )
+
+    luid_keys = sorted(
+        {k for k in list(util_map) + list(ded_map) + list(shr_map) if k not in ("global",) and not str(k).startswith("idx_")}
+    )
+    assignments: Dict[str, Dict[str, Any]] = {}
+    if catalog and luid_keys:
+        used = set()
+        by_vram = sorted(catalog, key=lambda g: g["memory_total_mb"], reverse=True)
+        by_mem = sorted(luid_keys, key=lambda k: _mem_mb(k) or 0.0, reverse=True)
+        for gpu in by_vram:
+            cap = gpu["memory_total_mb"] * 1.1 if gpu["memory_total_mb"] else None
+            picked = None
+            for key in by_mem:
+                if key in used:
+                    continue
+                mem_mb = _mem_mb(key) or 0.0
+                if cap is None or mem_mb <= cap:
+                    picked = key
+                    break
+            if picked is None:
+                for key in luid_keys:
+                    if key not in used:
+                        picked = key
+                        break
+            if picked:
+                used.add(picked)
+                assignments[gpu["name"]] = {
+                    "utilization": _clamp_percent(util_map.get(picked, 0.0)),
+                    "memory_used_mb": _mem_mb(picked) or 0.0,
+                    "adapter_index": picked,
+                }
+    elif len(catalog) == 1 and util_map:
+        key = "global" if "global" in util_map else max(util_map, key=util_map.get)
+        assignments[catalog[0]["name"]] = {
+            "utilization": _clamp_percent(util_map.get(key, 0.0)),
+            "memory_used_mb": _mem_mb(key) or 0.0,
+            "adapter_index": None if key == "global" else key,
+        }
+
+    rows = []
+    if catalog:
+        for gpu in catalog:
+            assigned = assignments.get(gpu["name"], {})
+            used_mb = float(assigned.get("memory_used_mb") or 0.0)
+            total_mb = float(gpu["memory_total_mb"] or 0.0)
+            if total_mb > 0 and used_mb > total_mb * 1.05:
+                used_mb = 0.0
+            row = {
+                "name": gpu["name"],
+                "utilization": float(assigned.get("utilization") or 0.0),
+                "memory_used_mb": used_mb,
+                "memory_total_mb": total_mb,
+                "vendor": gpu["vendor"],
+            }
+            if assigned.get("adapter_index") is not None:
+                row["adapter_index"] = assigned["adapter_index"]
+            rows.append(row)
+    elif luid_keys:
+        for key in luid_keys:
+            rows.append(
+                {
+                    "name": f"GPU {key}",
+                    "utilization": _clamp_percent(util_map.get(key, 0.0)),
+                    "memory_used_mb": _mem_mb(key) or 0.0,
+                    "memory_total_mb": 0.0,
+                    "vendor": "Unknown",
+                    "adapter_index": key,
+                }
+            )
+    return {"gpus": rows}
+
+
+def _npu_from_samples(samples: List[Tuple[str, str, float]], model: Optional[str]) -> Dict[str, Any]:
+    util = 0.0
+    for kind, _instance, value in samples:
+        if kind == "npu" and value > util:
+            util = value
+    return {"npu_utilization": _clamp_percent(util), "npu_model": model}
+
+
+def _publish_cpu_ram() -> None:
+    """~1s busy/elapsed, same window as Task Manager overall. Not the GPU period."""
+    cpu, mem = _sample_cpu_ram()
+    with _snapshot_lock:
+        _snapshot["cpu_usage"] = cpu
+        _snapshot["memory_usage"] = mem
+
+
+def _sample_gpu_disk() -> None:
+    global _pdh
+    disk = _sample_disk()
+    samples: List[Tuple[str, str, float]] = []
+    pdh_ok = False
+    if _pdh is not None:
+        try:
+            _pdh.maybe_reopen()
+            samples = _pdh.collect()
+            pdh_ok = True
+        except Exception as exc:
+            print(f"WARNING: PDH collect failed, reopening: {exc}", file=sys.stderr)
+            try:
+                _pdh.open()
+            except Exception as reopen_exc:
+                print(f"WARNING: PDH reopen failed: {reopen_exc}", file=sys.stderr)
+    info = _cached_identity("gpu_info", {})
+    npu_info = _cached_identity("npu_info", {})
+    if pdh_ok:
+        gpu_usage = _join_gpu_usage((info or {}).get("all_gpus") or [], samples)
+        npu_usage = _npu_from_samples(samples, (npu_info or {}).get("npu_model"))
     else:
-        # If event loop not running, run synchronously (shouldn't happen in FastAPI)
-        value = func(*args, **kwargs)
-        with _cache_lock:
-            _cache[key] = (value, time.time())
-            _refresh_last_time[key] = time.time()
+        # Keep the last numbers. Do not publish zeros because a collect failed.
+        previous = _copy_snapshot()
+        gpu_usage = previous["gpu_usage"]
+        npu_usage = previous["npu_usage"]
+        if npu_usage.get("npu_model") is None and (npu_info or {}).get("npu_model"):
+            npu_usage = dict(npu_usage)
+            npu_usage["npu_model"] = npu_info.get("npu_model")
+    with _snapshot_lock:
+        _snapshot["gpu_usage"] = gpu_usage
+        _snapshot["npu_usage"] = npu_usage
+        _snapshot["storage_live"] = disk
 
 
-async def _background_refresh_loop():
-    """Background task to continuously refresh cache entries."""
+def _sample_once() -> None:
+    _publish_cpu_ram()
+    _sample_gpu_disk()
+
+
+def _identity_warmup() -> None:
+    """CIM once at start, then only while a metrics client is active and TTL expired."""
+    jobs = (
+        ("gpu_info", _get_gpu_info),
+        ("npu_info", _get_npu_info),
+        ("memory_info", _get_memory_info),
+        ("storage_info", _get_storage_info),
+        ("chassis_info", _get_chassis_info),
+        ("power_info", _get_power_info),
+    )
+    primed = False
     while True:
         try:
-            await asyncio.sleep(1.0)  # Check every second
-            
-            now = time.time()
-            with _cache_lock:
-                cache_keys = list(_cache.keys())
-            
-            for key in cache_keys:
-                refresh_interval = _refresh_intervals.get(key)
-                if not refresh_interval:
-                    continue
-                
-                last_refresh = _refresh_last_time.get(key, 0)
-                if (now - last_refresh) >= refresh_interval:
-                    # Determine which function to call
-                    func_map = {
-                        'gpu_usage': _get_gpu_usage,
-                        'npu_usage': _get_npu_usage,
-                        'memory_info': _get_memory_info,
-                    }
-                    
-                    func = func_map.get(key)
-                    if func:
-                        _trigger_background_refresh(key, func)
-        except Exception as e:
-            print(f"WARNING: Background refresh loop error: {e}", file=sys.stderr)
-            await asyncio.sleep(5.0)  # Wait longer on error
+            if not primed or _metrics_client_active():
+                for key, func in jobs:
+                    with _cache_lock:
+                        item = _cache.get(key)
+                        fresh = item is not None and (time.time() - item[1]) < _cache_ttl.get(key, 30.0)
+                    if fresh:
+                        continue
+                    _get_cached(key, func)
+            primed = True
+        except Exception as exc:
+            print(f"WARNING: Identity warm-up failed: {exc}", file=sys.stderr)
+        time.sleep(5.0)
+
+
+def _prime_cpu_times() -> None:
+    """Baseline after PDH is open, so setup cost is not the first CPU reading."""
+    global _cpu_times_prev
+    times = _read_system_times()
+    _cpu_times_prev = (times[0], times[1], times[2], time.time())
+
+
+def _sampler_loop() -> None:
+    global _pdh
+    _pdh = _PdhUsageQuery()
+    try:
+        _pdh.open()
+    except Exception as exc:
+        print(f"WARNING: PDH open failed: {exc}", file=sys.stderr)
+    try:
+        _prime_cpu_times()
+        # Drop the startup second (PDH open / CIM). A short or busy setup
+        # slice was being held and read ~50% while Task Manager showed ~10%.
+        for _ in range(2):
+            time.sleep(1.0)
+            _prime_cpu_times()
+    except OSError as exc:
+        print(f"WARNING: CPU prime failed: {exc}", file=sys.stderr)
+    period = None
+    elapsed = 0.0
+    while True:
+        time.sleep(1.0)
+        elapsed += 1.0
+        # CPU/RAM stay on a 1s window even when GPU/NPU idle at 10s.
+        # A 10s average does not match Task Manager's overall %.
+        try:
+            _publish_cpu_ram()
+        except Exception as exc:
+            print(f"WARNING: CPU sample failed: {exc}", file=sys.stderr)
+        nxt = _SAMPLER_HOT_SEC if _metrics_client_active() else _SAMPLER_IDLE_SEC
+        if nxt != period:
+            period = nxt
+            print(f"INFO: host sampler period {period:.0f}s", file=sys.stderr)
+        if elapsed + 1e-6 < period:
+            continue
+        elapsed = 0.0
+        try:
+            _sample_gpu_disk()
+        except Exception as exc:
+            print(f"WARNING: Sampler tick failed: {exc}", file=sys.stderr)
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Start background refresh task on startup."""
-    # Warm up cache with initial values
-    try:
-        _get_cached('gpu_info', _get_gpu_info)
-        _get_cached('npu_info', _get_npu_info)
-    except Exception as e:
-        print(f"WARNING: Cache warm-up failed: {e}", file=sys.stderr)
-    
-    # Start background refresh loop
-    asyncio.create_task(_background_refresh_loop())
+    """Listen immediately. CIM and PDH run beside the server, not before it."""
+    if os.environ.get("ANRO_HOST_SKIP_SAMPLER") == "1":
+        return
+    Thread(target=_identity_warmup, name="host-identity", daemon=True).start()
+    Thread(target=_sampler_loop, name="host-sampler", daemon=True).start()
 
 
 def _find_powershell() -> Optional[str]:
@@ -610,118 +1073,26 @@ def _get_power_info() -> Dict[str, Any]:
 
 
 def _get_memory_usage() -> Dict[str, Any]:
-    """Get memory usage information from Windows via PowerShell."""
-    usage_script = '''
-    try {
-        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-        $totalBytes = $os.TotalVisibleMemorySize * 1024
-        $freeBytes = $os.FreePhysicalMemory * 1024
-        $usedBytes = $totalBytes - $freeBytes
-        
-        [PSCustomObject]@{
-            Total = $totalBytes
-            Used = $usedBytes
-            Available = $freeBytes
-        } | ConvertTo-Json -Depth 3
-    } catch {
-        Write-Error $_.Exception.Message
-        exit 1
-    }
-    '''
-    
-    result = _execute_powershell(usage_script, timeout=5)
-    
-    if result['success'] and result['output']:
-        try:
-            usage_data = json.loads(result['output'].strip())
-            return {
-                "total": usage_data.get('Total', 0),
-                "used": usage_data.get('Used', 0),
-                "available": usage_data.get('Available', 0)
-            }
-        except (json.JSONDecodeError, ValueError):
-            pass
-    
+    """Live RAM from the sampler snapshot. Does not start powershell.exe."""
+    snap = _copy_snapshot()["memory_usage"]
     return {
-        "total": 0,
-        "used": 0,
-        "available": 0
+        "total": int(snap.get("total") or 0),
+        "used": int(snap.get("used") or 0),
+        "available": int(snap.get("available") or 0),
     }
 
 
 def _get_cpu_usage() -> Dict[str, Any]:
-    """Get CPU usage — prefer % Processor Time (closer to Task Manager on modern AMD)."""
-    usage_script = '''
-    try {
-        $loadPercentage = $null
-
-        # Prefer Processor Time with a 1s two-sample window (first Get-Counter hit is often junk).
-        # On Ryzen AI / frequency-scaled CPUs, % Processor Utility can sit near/above 100 while
-        # Task Manager shows a lower overall %, so Time matches the UI users compare against.
-        $timeCounter = Get-Counter -Counter "\\Processor(_Total)\\% Processor Time" -SampleInterval 1 -MaxSamples 2 -ErrorAction SilentlyContinue
-        if ($timeCounter -and $timeCounter.CounterSamples -and $timeCounter.CounterSamples.Count -gt 0) {
-            $loadPercentage = [math]::Round([double]$timeCounter.CounterSamples[-1].CookedValue, 1)
-        }
-
-        if ($null -eq $loadPercentage) {
-            $cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($cpu -and $null -ne $cpu.LoadPercentage) {
-                $loadPercentage = [double]$cpu.LoadPercentage
-            }
-        }
-
-        if ($null -eq $loadPercentage) {
-            $utility = Get-Counter -Counter "\\Processor Information(_Total)\\% Processor Utility" -SampleInterval 1 -MaxSamples 2 -ErrorAction SilentlyContinue
-            if ($utility -and $utility.CounterSamples -and $utility.CounterSamples.Count -gt 0) {
-                $loadPercentage = [math]::Round([double]$utility.CounterSamples[-1].CookedValue, 1)
-            }
-        }
-
-        if ($null -eq $loadPercentage) { $loadPercentage = 0.0 }
-        if ($loadPercentage -lt 0) { $loadPercentage = 0.0 }
-        if ($loadPercentage -gt 100) { $loadPercentage = 100.0 }
-
-        $cores = @(Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue)
-        $totalCores = ($cores | Measure-Object -Property NumberOfCores -Sum).Sum
-        $logicalCores = ($cores | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
-        $cpu0 = $cores | Select-Object -First 1
-        $frequency = 0
-        if ($cpu0) {
-            $frequency = $cpu0.CurrentClockSpeed
-            if ($null -eq $frequency -or $frequency -eq 0) { $frequency = $cpu0.MaxClockSpeed }
-        }
-
-        [PSCustomObject]@{
-            Utilization = $loadPercentage
-            Frequency = $frequency
-            PhysicalCores = $totalCores
-            LogicalCores = $logicalCores
-        } | ConvertTo-Json -Depth 3
-    } catch {
-        Write-Error $_.Exception.Message
-        exit 1
-    }
-    '''
-    
-    result = _execute_powershell(usage_script, timeout=12)
-    
-    if result['success'] and result['output']:
-        try:
-            usage_data = json.loads(result['output'].strip())
-            return {
-                "utilization": usage_data.get('Utilization', 0.0),
-                "frequency": usage_data.get('Frequency', 0),
-                "physical_cores": usage_data.get('PhysicalCores', 0),
-                "logical_cores": usage_data.get('LogicalCores', 0)
-            }
-        except (json.JSONDecodeError, ValueError):
-            pass
-    
+    """Processor-time delta from the sampler. Never % Processor Utility, never a wait."""
+    snap = _copy_snapshot()["cpu_usage"]
+    util = snap.get("utilization")
+    if not isinstance(util, (int, float)):
+        util = 0.0
     return {
-        "utilization": 0.0,
-        "frequency": 0,
-        "physical_cores": 0,
-        "logical_cores": 0
+        "utilization": float(util),
+        "frequency": int(snap.get("frequency") or 0),
+        "physical_cores": int(snap.get("physical_cores") or 0),
+        "logical_cores": int(snap.get("logical_cores") or 0),
     }
 
 
@@ -733,670 +1104,81 @@ async def health_check():
 
 @app.get("/api/version")
 async def get_version():
-    """Get service version (aligned with llm-management app release)."""
+    """Host-service version. Does not have to match the agent image."""
     return {"version": __version__, "service": "windows-host-service"}
 
 
 @app.get("/api/cpu/usage")
 async def get_cpu_usage():
-    """Get CPU usage information."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _get_cpu_usage)
+    """Copy the sampler snapshot. Do not take a fresh sample on this request."""
+    _touch_metrics_client()
+    return _get_cpu_usage()
 
 
 def _get_gpu_usage() -> Dict[str, Any]:
-    """Get GPU usage information (utilization, memory usage) from Windows Performance Counters.
-    
-    Supports both NVIDIA and AMD GPUs with optimized batch counter queries.
-    """
-    usage_script = '''
-    try {
-        # Get all valid GPUs
-        $gpus = Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { 
-            $_.Name -and $_.Name.Trim() -ne ""
-        } | Where-Object {
-            $name = $_.Name.ToLower()
-            $name -notlike "*sharing monitor*" -and
-            $name -notlike "*microsoft basic display*" -and
-            $name -notlike "*microsoft corporation device*" -and
-            $name -notlike "*remote desktop*" -and
-            $name -notlike "*virtual display*" -and
-            $name -notlike "*microsoft remote*" -and
-            $name -notlike "*npu*" -and
-            $name -notlike "*compute accelerator*" -and
-            $name -notlike "*ai boost*"
+    """GPU usage from the sampler snapshot. No CIM and no powershell.exe."""
+    snap = _copy_snapshot()["gpu_usage"]
+    gpus = []
+    for row in snap.get("gpus") or []:
+        util = row.get("utilization")
+        if not isinstance(util, (int, float)):
+            util = 0.0
+        cleaned = {
+            "name": row.get("name") or "Unknown GPU",
+            "utilization": float(util),
+            "memory_used_mb": float(row.get("memory_used_mb") or 0.0),
+            "memory_total_mb": float(row.get("memory_total_mb") or 0.0),
+            "vendor": row.get("vendor") or "Unknown",
         }
-        
-        if (-not $gpus) {
-            Write-Output "[]"
-            exit 0
-        }
-        
-        # Build GPU list with vendor detection and adapter info
-        $gpuList = @()
-        foreach ($gpu in $gpus) {
-            $gpuName = $gpu.Name
-            $adapterRAM = $gpu.AdapterRAM
-            if ($adapterRAM -lt 0) {
-                $adapterRAM = [uint64]($adapterRAM + [Math]::Pow(2, 64))
-            }
-            
-            # Try to get accurate VRAM from registry (same method as _get_gpu_info)
-            $vramBytes = $null
-            try {
-                $regPath = "HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\*"
-                $regGpus = Get-ItemProperty -Path $regPath -Name "HardwareInformation.QwMemorySize","DriverDesc" -ErrorAction SilentlyContinue
-                foreach ($regGpu in $regGpus) {
-                    if ($regGpu.DriverDesc -and $regGpu."HardwareInformation.QwMemorySize") {
-                        $desc = $regGpu.DriverDesc.ToLower()
-                        $name = $gpuName.ToLower()
-                        if ($desc -like "*$name*" -or $name -like "*$desc*") {
-                            $vramBytes = $regGpu."HardwareInformation.QwMemorySize"
-                            break
-                        }
-                    }
-                }
-            } catch {}
-            
-            if ($vramBytes) {
-                $adapterRAM = $vramBytes
-            }
-            
-            # Detect vendor
-            $vendor = "Unknown"
-            $nameLower = $gpuName.ToLower()
-            if ($nameLower -like "*nvidia*" -or $nameLower -like "*geforce*" -or $nameLower -like "*rtx*" -or $nameLower -like "*gtx*" -or $nameLower -like "*quadro*" -or $nameLower -like "*tesla*") {
-                $vendor = "NVIDIA"
-            } elseif ($nameLower -like "*amd*" -or $nameLower -like "*radeon*" -or $nameLower -like "*rx*" -or $nameLower -like "*rdna*" -or $nameLower -like "*vega*") {
-                $vendor = "AMD"
-            } elseif ($nameLower -like "*intel*" -or $nameLower -like "*arc*" -or $nameLower -like "*iris*" -or $nameLower -like "*uhd graphics*") {
-                $vendor = "Intel"
-            }
-            
-            $gpuList += [PSCustomObject]@{
-                Name = $gpuName
-                AdapterRAM = $adapterRAM
-                Vendor = $vendor
-                Index = $gpu.Index
-                PNPDeviceID = $gpu.PNPDeviceID
-            }
-        }
-        
-        # Build combined counter paths for batch query (optimized - single call)
-        $counterPaths = @()
-        
-        # Common counters for both vendors
-        $counterPaths += "\\GPU Engine(*)\\Utilization Percentage"
-        
-        # Use GPU Adapter Memory counters (most accurate - gives total adapter memory usage)
-        $counterPaths += "\\GPU Adapter Memory(*)\\Dedicated Usage"
-        $counterPaths += "\\GPU Adapter Memory(*)\\Shared Usage"
-        
-        # Fallback: try other adapter counter formats
-        $counterPaths += "\\GPU Adapter(*)\\Dedicated Usage"
-        $counterPaths += "\\GPU Adapter(*)\\Shared Usage"
-        
-        # Last resort: process-level counters (need to sum per adapter, less accurate)
-        $counterPaths += "\\GPU Process Memory(*)\\Dedicated Usage"
-        $counterPaths += "\\GPU Process Memory(*)\\Shared Usage"
-        
-        # Batch query all counters at once.
-        # Keep MaxSamples 1 for latency: dual-GPU laptops can have thousands of
-        # GPU Engine instances; MaxSamples 2 made /api/gpu/usage multi-second/hang.
-        # LUID assignment (below) is what fixes stuck-at-0%, not the second sample.
-        $allCounters = $null
-                try {
-            $allCounters = Get-Counter -Counter $counterPaths -SampleInterval 1 -MaxSamples 1 -ErrorAction SilentlyContinue
-        } catch {
-            # Performance counters may not be available
-        }
-        
-        function Get-LuidKeyFromInstance([string]$instanceName) {
-            if ($instanceName -match 'luid_0x([0-9a-f]+)_0x([0-9a-f]+)') {
-                return ($matches[1] + '_' + $matches[2]).ToLower()
-            }
-            return $null
-        }
-        function Set-MapMax([hashtable]$map, [string]$key, [double]$val) {
-            if (-not $map.ContainsKey($key) -or $val -gt $map[$key]) {
-                $map[$key] = $val
-            }
-        }
-        function Set-MapMaxLong([hashtable]$map, [string]$key, [long]$val) {
-            if (-not $map.ContainsKey($key) -or $val -gt $map[$key]) {
-                $map[$key] = $val
-            }
-        }
-
-        # Process counter results (prefer LUID keys — each GPU may use phys_0)
-        $utilizationMap = @{}
-        $memoryDedicatedMap = @{}
-        $memorySharedMap = @{}
-        $allMemoryValues = @()
-        
-        if ($allCounters -and $allCounters.CounterSamples) {
-            foreach ($sample in $allCounters.CounterSamples) {
-                if ($sample.CookedValue -eq $null) { continue }
-                
-                $counterValue = [double]$sample.CookedValue
-                $instanceName = $sample.InstanceName
-                $counterPath = $sample.Path
-                $luidKey = Get-LuidKeyFromInstance $instanceName
-                                
-                # Extract adapter index from instance name (single-GPU fallback only)
-                $adapterIdx = $null
-                if ($instanceName -match "phys_(\\d+)") {
-                    $adapterIdx = [int]$matches[1]
-                } elseif ($instanceName -match "adapter_(\\d+)") {
-                    $adapterIdx = [int]$matches[1]
-                } elseif ($instanceName -match "^(\\d+)") {
-                    $adapterIdx = [int]$matches[1]
-                }
-                $mapKey = if ($luidKey) { $luidKey } elseif ($adapterIdx -ne $null) { "idx_$adapterIdx" } else { $null }
-                
-                # Process utilization counters
-                if ($counterPath -like "*Utilization Percentage*") {
-                    if ($mapKey) {
-                        Set-MapMax $utilizationMap $mapKey $counterValue
-                        # Also index by phys_N so single-GPU / Index fallback can match
-                        # when Win32_VideoController.Index is empty (common on AMD CIM).
-                        if ($luidKey -and $adapterIdx -ne $null) {
-                            Set-MapMax $utilizationMap "idx_$adapterIdx" $counterValue
-                        }
-                    } else {
-                        if (-not $utilizationMap.ContainsKey("global")) {
-                            $utilizationMap["global"] = 0.0
-                        }
-                        if ($counterValue -gt $utilizationMap["global"]) {
-                            $utilizationMap["global"] = $counterValue
-                        }
-                    }
-                    # Always track a global max for single-GPU fallback
-                    if (-not $utilizationMap.ContainsKey("global") -or $counterValue -gt $utilizationMap["global"]) {
-                        $utilizationMap["global"] = $counterValue
-                    }
-                }
-                
-                # Process memory counters (in bytes, convert to MB)
-                # Prefer GPU Adapter Memory counters (most accurate - total usage directly)
-                if ($counterPath -like "*Adapter Memory*Dedicated Usage*") {
-                    $memAdapterIdx = $null
-                    if ($adapterIdx -ne $null) {
-                        $memAdapterIdx = $adapterIdx
-                    } elseif ($instanceName -match "adapter_(\\d+)") {
-                        $memAdapterIdx = [int]$matches[1]
-                    } elseif ($instanceName -match "phys_(\\d+)") {
-                        $memAdapterIdx = [int]$matches[1]
-                    } elseif ($instanceName -match "^(\\d+)") {
-                        $memAdapterIdx = [int]$matches[1]
-                    }
-                    
-                    if ($luidKey) {
-                        Set-MapMaxLong $memoryDedicatedMap $luidKey ([long]$counterValue)
-                    } elseif ($memAdapterIdx -ne $null) {
-                        $idxKey = "idx_$memAdapterIdx"
-                        Set-MapMaxLong $memoryDedicatedMap $idxKey ([long]$counterValue)
-                    }
-                    $allMemoryValues += [PSCustomObject]@{
-                        Value = [long]$counterValue
-                        InstanceName = $instanceName
-                        AdapterIdx = $memAdapterIdx
-                        LuidKey = $luidKey
-                    }
-                } elseif ($counterPath -like "*Adapter*Dedicated Usage*" -and $counterPath -notlike "*Process*") {
-                    if ($mapKey) {
-                        Set-MapMaxLong $memoryDedicatedMap $mapKey ([long]$counterValue)
-                    }
-                } elseif ($counterPath -like "*Process Memory*Dedicated Usage*") {
-                    # Fallback: process-level counter - need to sum per adapter carefully
-                    # Process memory instance format can be: "pid_adapter_X" or "processname_adapter_X" or just "adapter_X"
-                    $procAdapterIdx = $null
-                    
-                    # Try to extract adapter index from instance name
-                    if ($instanceName -match "adapter_(\d+)") {
-                        $procAdapterIdx = [int]$matches[1]
-                    } elseif ($instanceName -match "phys_(\d+)") {
-                        $procAdapterIdx = [int]$matches[1]
-                    } elseif ($instanceName -match "^(\d+)") {
-                        # Might be just adapter index
-                        $procAdapterIdx = [int]$matches[1]
-                    }
-                    
-                    # If we found an adapter index, sum the memory
-                    if ($luidKey) {
-                        if (-not $memoryDedicatedMap.ContainsKey($luidKey)) {
-                            $memoryDedicatedMap[$luidKey] = 0
-                        }
-                        $memoryDedicatedMap[$luidKey] += [long]$counterValue
-                    } elseif ($procAdapterIdx -ne $null) {
-                        $idxKey = "idx_$procAdapterIdx"
-                        if (-not $memoryDedicatedMap.ContainsKey($idxKey)) {
-                            $memoryDedicatedMap[$idxKey] = 0
-                        }
-                        $memoryDedicatedMap[$idxKey] += [long]$counterValue
-                    } elseif ($mapKey) {
-                        if (-not $memoryDedicatedMap.ContainsKey($mapKey)) {
-                            $memoryDedicatedMap[$mapKey] = 0
-                        }
-                        $memoryDedicatedMap[$mapKey] += [long]$counterValue
-                    } elseif (-not $memoryDedicatedMap.ContainsKey("global")) {
-                        $memoryDedicatedMap["global"] = 0
-                    } else {
-                        $memoryDedicatedMap["global"] += [long]$counterValue
-                    }
-                }
-                
-                if ($counterPath -like "*Adapter Memory*Shared Usage*") {
-                    if ($mapKey) {
-                        Set-MapMaxLong $memorySharedMap $mapKey ([long]$counterValue)
-                    } elseif ($adapterIdx -ne $null) {
-                        Set-MapMaxLong $memorySharedMap "idx_$adapterIdx" ([long]$counterValue)
-                    }
-                } elseif ($counterPath -like "*Adapter*Shared Usage*" -and $counterPath -notlike "*Process*") {
-                    if ($mapKey) {
-                        Set-MapMaxLong $memorySharedMap $mapKey ([long]$counterValue)
-                    }
-                } elseif ($counterPath -like "*Process Memory*Shared Usage*") {
-                    if ($luidKey) {
-                        if (-not $memorySharedMap.ContainsKey($luidKey)) {
-                            $memorySharedMap[$luidKey] = 0
-                        }
-                        $memorySharedMap[$luidKey] += [long]$counterValue
-                    } elseif ($instanceName -match "adapter_(\\d+)") {
-                        $procAdapterIdx = [int]$matches[1]
-                        $idxKey = "idx_$procAdapterIdx"
-                        if (-not $memorySharedMap.ContainsKey($idxKey)) {
-                            $memorySharedMap[$idxKey] = 0
-                        }
-                        $memorySharedMap[$idxKey] += [long]$counterValue
-                    } elseif ($mapKey) {
-                        if (-not $memorySharedMap.ContainsKey($mapKey)) {
-                            $memorySharedMap[$mapKey] = 0
-                        }
-                        $memorySharedMap[$mapKey] += [long]$counterValue
-                    }
-                }
-            }
-        }
-        
-        function Get-UtilForKey([string]$key) {
-            if ($utilizationMap.ContainsKey($key)) {
-                return [math]::Round($utilizationMap[$key], 2)
-            }
-            return $null
-        }
-        function Get-MemMbForKey([string]$key) {
-            $ded = [long]0
-            $shr = [long]0
-            $found = $false
-            if ($memoryDedicatedMap.ContainsKey($key)) {
-                $ded = [long]$memoryDedicatedMap[$key]
-                $found = $true
-            }
-            if ($memorySharedMap.ContainsKey($key)) {
-                $shr = [long]$memorySharedMap[$key]
-                $found = $true
-            }
-            if ($found) {
-                return [math]::Round(($ded + $shr) / 1MB, 2)
-            }
-            return $null
-        }
-        function Get-LuidKeysFromMaps() {
-            @(
-                $memoryDedicatedMap.Keys + $memorySharedMap.Keys + $utilizationMap.Keys |
-                Where-Object { $_ -is [string] -and $_ -notlike "idx_*" -and $_ -ne "global" }
-            ) | Select-Object -Unique
-        }
-
-        $singleGpu = ($gpuList.Count -eq 1)
-        $luidKeys = @(Get-LuidKeysFromMaps)
-        # Use LUID pairing for single-GPU too: AMD iGPU counters are LUID-keyed and
-        # Win32_VideoController.Index is often empty, so idx_* lookup alone yields 0%.
-        $useLuidAssignment = ($luidKeys.Count -gt 0)
-
-        $gpuEntries = @()
-        if ($useLuidAssignment) {
-            $usedLuids = @{}
-            $gpusSorted = @($gpuList | Sort-Object { [uint64]$_.AdapterRAM } -Descending)
-            $luidsByMem = @($luidKeys | Sort-Object { Get-MemMbForKey $_ } -Descending)
-            $assignments = @{}
-
-            foreach ($gpuInfo in $gpusSorted) {
-                $capMb = ([double]$gpuInfo.AdapterRAM / 1MB) * 1.1
-                $picked = $null
-                foreach ($lk in $luidsByMem) {
-                    if ($usedLuids[$lk]) { continue }
-                    $memMb = Get-MemMbForKey $lk
-                    if ($memMb -le $capMb) {
-                        $picked = $lk
-                        break
-                    }
-                }
-                if (-not $picked) {
-                    foreach ($lk in ($luidKeys | Sort-Object { Get-MemMbForKey $_ })) {
-                        if (-not $usedLuids[$lk]) { $picked = $lk; break }
-                    }
-                }
-                if ($picked) {
-                    $usedLuids[$picked] = $true
-                    $u = Get-UtilForKey $picked
-                    $m = Get-MemMbForKey $picked
-                    $assignments[$gpuInfo.Name] = [PSCustomObject]@{
-                        Utilization = if ($u -ne $null) { $u } else { 0.0 }
-                        MemoryUsedMb = if ($m -ne $null) { $m } else { 0.0 }
-                        LuidKey = $picked
-                    }
-                }
-            }
-
-            foreach ($gpuInfo in $gpuList) {
-                $a = $assignments[$gpuInfo.Name]
-                $gpuEntries += [PSCustomObject]@{
-                    GpuInfo = $gpuInfo
-                    Utilization = if ($a) { [double]$a.Utilization } else { 0.0 }
-                    MemoryUsedMb = if ($a) { [double]$a.MemoryUsedMb } else { 0.0 }
-                    AdapterIndex = if ($a) { $a.LuidKey } else { $null }
-                }
-            }
-        } else {
-            function Get-UtilForIdx([int[]]$idxList) {
-                foreach ($idx in $idxList) {
-                    $k = "idx_$idx"
-                    $u = Get-UtilForKey $k
-                    if ($u -ne $null) { return $u }
-                    if ($utilizationMap.ContainsKey($idx)) {
-                        return [math]::Round($utilizationMap[$idx], 2)
-                    }
-                }
-                return $null
-            }
-            function Get-MemMbForIdx([int[]]$idxList) {
-                foreach ($idx in $idxList) {
-                    $m = Get-MemMbForKey "idx_$idx"
-                    if ($m -ne $null) { return $m }
-                }
-                return $null
-            }
-            function Test-IdxHasData([int]$idx) {
-                $k = "idx_$idx"
-                return ($utilizationMap.ContainsKey($k) -or $memoryDedicatedMap.ContainsKey($k) -or $memorySharedMap.ContainsKey($k) -or
-                    $utilizationMap.ContainsKey($idx) -or $memoryDedicatedMap.ContainsKey($idx))
-            }
-
-            $usedCounterKeys = @{}
-            $enumIndex = 0
-            foreach ($gpuInfo in $gpuList) {
-                $idxCandidates = @()
-                if ($gpuInfo.Index -ne $null) { $idxCandidates += [int]$gpuInfo.Index }
-                if ($idxCandidates -notcontains $enumIndex) { $idxCandidates += $enumIndex }
-
-                $matchedIdx = $null
-                foreach ($c in $idxCandidates) {
-                    if ($usedCounterKeys.ContainsKey($c)) { continue }
-                    if (Test-IdxHasData $c) {
-                        $matchedIdx = $c
-                        break
-                    }
-                }
-
-                $utilization = 0.0
-                $memoryUsed = 0.0
-                if ($matchedIdx -ne $null) {
-                    $u = Get-UtilForIdx @($matchedIdx)
-                    if ($u -ne $null) { $utilization = $u }
-                    $m = Get-MemMbForIdx @($matchedIdx)
-                    if ($m -ne $null) { $memoryUsed = $m }
-                    $usedCounterKeys[$matchedIdx] = $true
-                } elseif ($singleGpu -and $utilizationMap.ContainsKey("global")) {
-                    $utilization = [math]::Round($utilizationMap["global"], 2)
-                } elseif ($singleGpu -and $utilizationMap.Count -gt 0) {
-                    $maxU = 0.0
-                    foreach ($uk in $utilizationMap.Keys) {
-                        if ([double]$utilizationMap[$uk] -gt $maxU) { $maxU = [double]$utilizationMap[$uk] }
-                    }
-                    $utilization = [math]::Round($maxU, 2)
-                }
-
-                $gpuEntries += [PSCustomObject]@{
-                    GpuInfo = $gpuInfo
-                    Utilization = $utilization
-                    MemoryUsedMb = $memoryUsed
-                    AdapterIndex = $matchedIdx
-                    PhaseAMatched = ($matchedIdx -ne $null)
-                }
-                $enumIndex++
-            }
-
-            if (-not $singleGpu) {
-                $unmatched = @($gpuEntries | Where-Object { -not $_.PhaseAMatched })
-                $unusedKeys = @(
-                    $memoryDedicatedMap.Keys + $memorySharedMap.Keys + $utilizationMap.Keys |
-                    Where-Object { $_ -like "idx_*" -and -not $usedCounterKeys.ContainsKey([int]($_ -replace '^idx_','')) } |
-                    Select-Object -Unique |
-                    Sort-Object { [int]($_ -replace '^idx_','') }
-                )
-                if ($unmatched.Count -gt 0 -and $unusedKeys.Count -gt 0) {
-                    $unmatchedSorted = $unmatched | Sort-Object { $_.GpuInfo.AdapterRAM } -Descending
-                    $pairCount = [Math]::Min($unmatchedSorted.Count, $unusedKeys.Count)
-                    for ($i = 0; $i -lt $pairCount; $i++) {
-                        $entry = $unmatchedSorted[$i]
-                        $key = $unusedKeys[$i]
-                        $u = Get-UtilForKey $key
-                        if ($u -ne $null) { $entry.Utilization = $u }
-                        $m = Get-MemMbForKey $key
-                        if ($m -ne $null) { $entry.MemoryUsedMb = $m }
-                        $entry.AdapterIndex = $key
-                    }
-                }
-            }
-        }
-
-        $result = @()
-        foreach ($entry in $gpuEntries) {
-            $gi = $entry.GpuInfo
-            $memoryTotal = [math]::Round($gi.AdapterRAM / 1MB, 2)
-            $memUsed = [double]$entry.MemoryUsedMb
-            if ($memoryTotal -gt 0 -and $memUsed -gt ($memoryTotal * 1.05)) {
-                $memUsed = 0.0
-            }
-            $result += [PSCustomObject]@{
-                name = $gi.Name
-                utilization = [double]$entry.Utilization
-                memory_used_mb = $memUsed
-                memory_total_mb = [double]$memoryTotal
-                vendor = $gi.Vendor
-                adapter_index = $entry.AdapterIndex
-            }
-        }
-        
-        $result | ConvertTo-Json -Depth 3
-    } catch {
-        Write-Error $_.Exception.Message
-        exit 1
-    }
-    '''
-    
-    result = _execute_powershell(usage_script, timeout=15)
-    
-    if not result['success']:
-        # Return empty list on error, don't fail completely
-        return {'gpus': []}
-    
-    try:
-        output = result['output'].strip()
-        if not output or output == '[]' or output == 'null':
-            return {'gpus': []}
-        
-        usage_data = json.loads(output)
-        if not isinstance(usage_data, list):
-            usage_data = [usage_data] if usage_data else []
-        
-        # Clean up and normalize the data
-        cleaned_gpus = []
-        for gpu in usage_data:
-            utilization = gpu.get('utilization', gpu.get('Utilization', 0.0))
-            if isinstance(utilization, dict):
-                utilization = utilization.get('value', 0.0)
-            elif not isinstance(utilization, (int, float)):
-                utilization = 0.0
-            
-            cleaned_gpu = {
-                'name': gpu.get('name', gpu.get('Name', 'Unknown GPU')),
-                'utilization': float(utilization),
-                'memory_used_mb': float(gpu.get('memory_used_mb', gpu.get('MemoryUsed', 0))),
-                'memory_total_mb': float(gpu.get('memory_total_mb', gpu.get('MemoryTotal', 0))),
-                'vendor': gpu.get('vendor', gpu.get('Vendor', 'Unknown')),
-            }
-            if gpu.get('adapter_index') is not None:
-                cleaned_gpu['adapter_index'] = gpu.get('adapter_index')
-            cleaned_gpus.append(cleaned_gpu)
-        
-        return {'gpus': cleaned_gpus}
-    except json.JSONDecodeError as e:
-        # Return empty list on parse error
-        return {'gpus': []}
+        if row.get("adapter_index") is not None:
+            cleaned["adapter_index"] = row.get("adapter_index")
+        gpus.append(cleaned)
+    return {"gpus": gpus}
 
 
 @app.get("/api/gpu")
 async def get_gpu():
-    """Get GPU information."""
+    """GPU identity. CIM only on cache miss, never from the usage sampler."""
+    _touch_metrics_client()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _get_cached('gpu_info', _get_gpu_info))
+    return await loop.run_in_executor(None, lambda: _get_cached("gpu_info", _get_gpu_info))
 
 
 @app.get("/api/gpu/usage")
 async def get_gpu_usage():
-    """Get GPU usage information (utilization, memory usage)."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _get_cached('gpu_usage', _get_gpu_usage))
+    """Copy the sampler snapshot. Do not collect PDH on this request."""
+    _touch_metrics_client()
+    return _get_gpu_usage()
 
 
 def _get_npu_usage() -> Dict[str, Any]:
-    """Get NPU utilization information from Windows Performance Counters.
-    
-    Supports AMD XDNA NPU via performance counters.
-    """
-    # First get NPU info to check if NPU exists
-    npu_info = _get_npu_info()
-    if not npu_info or not npu_info.get('npu_model'):
-        return {
-            'npu_utilization': 0.0,
-            'npu_model': None
-        }
-    
-    npu_model = npu_info.get('npu_model', '')
-    
-    usage_script = '''
-    try {
-        # Try multiple NPU counter paths (batch query for efficiency)
-        $counterPaths = @(
-            "\\NPU Engine(*)\\Utilization Percentage",
-            "\\AMD XDNA Engine(*)\\Utilization Percentage",
-            "\\Compute Accelerator(*)\\Utilization Percentage",
-            "\\NPU(*)\\Utilization Percentage"
-        )
-        
-        $utilization = 0.0
-        $foundCounter = $false
-        
-        # Try to get NPU utilization from performance counters
-        try {
-            $counters = Get-Counter -Counter $counterPaths -SampleInterval 1 -MaxSamples 1 -ErrorAction SilentlyContinue
-            if ($counters -and $counters.CounterSamples) {
-                foreach ($sample in $counters.CounterSamples) {
-                    if ($sample.CookedValue -ne $null) {
-                        $counterValue = [double]$sample.CookedValue
-                        # Take the maximum utilization across all NPU engines
-                        if ($counterValue -gt $utilization) {
-                            $utilization = $counterValue
-                            $foundCounter = $true
-                        }
-                    }
-                }
-            }
-        } catch {
-            # Performance counters may not be available for NPU
-        }
-        
-        # If no counter found, try alternative method
-        if (-not $foundCounter) {
-            # Try to get NPU device status (fallback)
-            try {
-                $npuDevice = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
-                    (($_.Name -like "*NPU*" -and $_.Name -like "*Compute Accelerator*") -or 
-                     $_.Name -like "*XDNA*" -or 
-                     ($_.Name -like "*AMD*" -and $_.Name -like "*Neural Processing*") -or
-                     ($_.Name -like "*AMD*" -and $_.Name -like "*AI Engine*") -or
-                     $_.Name -like "*Intel*AI Boost*") -and
-                    $_.Status -eq "OK"
-                } | Select-Object -First 1
-                
-                if ($npuDevice) {
-                    # NPU is present but utilization not available via counters
-                    # Return 0.0 to indicate NPU exists but utilization unavailable
-                    $utilization = 0.0
-                }
-            } catch {
-                # NPU device query failed
-            }
-        }
-        
-        [PSCustomObject]@{
-            Utilization = [math]::Round($utilization, 2)
-        } | ConvertTo-Json -Depth 3
-    } catch {
-        Write-Error $_.Exception.Message
-        exit 1
-    }
-    '''
-    
-    result = _execute_powershell(usage_script, timeout=10)
-    
-    if not result['success']:
-        return {
-            'npu_utilization': 0.0,
-            'npu_model': npu_model
-        }
-    
-    try:
-        output = result['output'].strip()
-        if output:
-            usage_data = json.loads(output)
-            utilization = usage_data.get('Utilization', 0.0)
-            if not isinstance(utilization, (int, float)):
-                utilization = 0.0
-            
-            return {
-                'npu_utilization': float(utilization),
-                'npu_model': npu_model
-            }
-    except (json.JSONDecodeError, ValueError):
-        pass
-    
-    return {
-        'npu_utilization': 0.0,
-        'npu_model': npu_model
-    }
+    """NPU usage from the sampler. Does not call _get_npu_info() or PnP."""
+    snap = _copy_snapshot()["npu_usage"]
+    util = snap.get("npu_utilization")
+    if not isinstance(util, (int, float)):
+        util = 0.0
+    return {"npu_utilization": float(util), "npu_model": snap.get("npu_model")}
 
 
 @app.get("/api/npu")
 async def get_npu():
-    """Get NPU information."""
+    """NPU identity. CIM only on cache miss."""
+    _touch_metrics_client()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _get_cached('npu_info', _get_npu_info))
+    return await loop.run_in_executor(None, lambda: _get_cached("npu_info", _get_npu_info))
 
 
 @app.get("/api/npu/usage")
 async def get_npu_usage():
-    """Get NPU utilization information."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _get_cached('npu_usage', _get_npu_usage))
+    """Copy the sampler snapshot. Do not query PnP or the CPU model."""
+    _touch_metrics_client()
+    return _get_npu_usage()
 
 
 @app.get("/api/memory")
 async def get_memory():
-    """Get memory information."""
+    """Memory capacity. CIM only on cache miss."""
+    _touch_metrics_client()
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _get_cached('memory_info', _get_memory_info))
 
@@ -1415,9 +1197,9 @@ async def get_power():
 
 @app.get("/api/memory/usage")
 async def get_memory_usage():
-    """Get memory usage information."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _get_memory_usage)
+    """Copy the sampler snapshot. Do not query Win32_OperatingSystem."""
+    _touch_metrics_client()
+    return _get_memory_usage()
 
 
 def _get_storage_info() -> Dict[str, Any]:
@@ -1497,109 +1279,62 @@ def _get_storage_info() -> Dict[str, Any]:
     }
 
 
+def _storage_view() -> Dict[str, Any]:
+    """Capacity/type from identity cache. Free space from the sampler, not CIM."""
+    info = _cached_identity("storage_info", {}) or {}
+    live = _copy_snapshot().get("storage_live") or {}
+    size = info.get("storage_size") or live.get("storage_size_live") or 0
+    free = live.get("storage_free")
+    if free is None:
+        free = info.get("storage_free") or 0
+    return {
+        "storage_size": size,
+        "storage_free": free,
+        "storage_type": info.get("storage_type") or "Unknown",
+    }
+
+
+def _specs_from_cache(snap: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Last identity plus current usage. A CIM miss must not delay usage fields."""
+    if snap is None:
+        snap = _copy_snapshot()
+    return {
+        "gpu_info": _cached_identity("gpu_info", {"all_gpus": []}),
+        "gpu_usage": snap["gpu_usage"],
+        "npu_info": _cached_identity("npu_info", {}),
+        "npu_usage": snap["npu_usage"],
+        "memory_info": _cached_identity("memory_info", {}),
+        "storage_info": _storage_view(),
+        "chassis_info": _cached_identity("chassis_info", {}),
+        "power_info": _cached_identity("power_info", {}),
+    }
+
+
 @app.get("/api/storage")
 async def get_storage():
-    """Get storage information."""
-    return _get_storage_info()
+    """Storage view. Does not start powershell.exe on this request."""
+    _touch_metrics_client()
+    return _storage_view()
 
 
 @app.get("/api/system-specs")
 async def get_system_specs():
-    """Get full system specifications."""
-    # Execute expensive operations in parallel using asyncio
-    loop = asyncio.get_event_loop()
-    
-    # Run CPU-bound operations in thread pool to avoid blocking
-    gpu_info_task = loop.run_in_executor(None, lambda: _get_cached('gpu_info', _get_gpu_info))
-    gpu_usage_task = loop.run_in_executor(None, lambda: _get_cached('gpu_usage', _get_gpu_usage))
-    npu_info_task = loop.run_in_executor(None, lambda: _get_cached('npu_info', _get_npu_info))
-    npu_usage_task = loop.run_in_executor(None, lambda: _get_cached('npu_usage', _get_npu_usage))
-    memory_info_task = loop.run_in_executor(None, lambda: _get_cached('memory_info', _get_memory_info))
-    storage_info_task = loop.run_in_executor(None, lambda: _get_cached('storage_info', _get_storage_info))
-    chassis_task = loop.run_in_executor(None, lambda: _get_cached("chassis_info", _get_chassis_info))
-    power_task = loop.run_in_executor(None, lambda: _get_cached("power_info", _get_power_info))
-    
-    # Wait for all tasks to complete in parallel
-    gpu_info, gpu_usage, npu_info, npu_usage, memory_info, storage_info, chassis_info, power_info = await asyncio.gather(
-        gpu_info_task,
-        gpu_usage_task,
-        npu_info_task,
-        npu_usage_task,
-        memory_info_task,
-        storage_info_task,
-        chassis_task,
-        power_task,
-    )
-    
-    return {
-        "gpu_info": gpu_info,
-        "gpu_usage": gpu_usage,
-        "npu_info": npu_info,
-        "npu_usage": npu_usage,
-        "memory_info": memory_info,
-        "storage_info": storage_info,
-        "chassis_info": chassis_info,
-        "power_info": power_info,
-    }
+    """Last identity plus sampler usage. Does not collect counters inline."""
+    _touch_metrics_client()
+    return _specs_from_cache()
 
 
 @app.get("/api/metrics/bundle")
 async def get_metrics_bundle():
-    """Single round-trip for llm-management /api/resources (CPU, RAM, GPU usage, system specs).
-
-    Includes chassis_info / power_info for parity with linux_host_service.py.
-    """
-    loop = asyncio.get_event_loop()
-    cpu_task = loop.run_in_executor(None, _get_cpu_usage)
-    mem_task = loop.run_in_executor(None, _get_memory_usage)
-    gpu_usage_task = loop.run_in_executor(None, lambda: _get_cached("gpu_usage", _get_gpu_usage))
-    gpu_info_task = loop.run_in_executor(None, lambda: _get_cached("gpu_info", _get_gpu_info))
-    npu_info_task = loop.run_in_executor(None, lambda: _get_cached("npu_info", _get_npu_info))
-    npu_usage_task = loop.run_in_executor(None, lambda: _get_cached("npu_usage", _get_npu_usage))
-    memory_info_task = loop.run_in_executor(None, lambda: _get_cached("memory_info", _get_memory_info))
-    storage_info_task = loop.run_in_executor(None, lambda: _get_cached("storage_info", _get_storage_info))
-    chassis_task = loop.run_in_executor(None, lambda: _get_cached("chassis_info", _get_chassis_info))
-    power_task = loop.run_in_executor(None, lambda: _get_cached("power_info", _get_power_info))
-
-    (
-        cpu_usage,
-        memory_usage,
-        gpu_usage,
-        gpu_info,
-        npu_info,
-        npu_usage,
-        memory_info,
-        storage_info,
-        chassis_info,
-        power_info,
-    ) = await asyncio.gather(
-        cpu_task,
-        mem_task,
-        gpu_usage_task,
-        gpu_info_task,
-        npu_info_task,
-        npu_usage_task,
-        memory_info_task,
-        storage_info_task,
-        chassis_task,
-        power_task,
-    )
-
-    system_specs = {
-        "gpu_info": gpu_info,
-        "gpu_usage": gpu_usage,
-        "npu_info": npu_info,
-        "npu_usage": npu_usage,
-        "memory_info": memory_info,
-        "storage_info": storage_info,
-        "chassis_info": chassis_info,
-        "power_info": power_info,
-    }
+    """Single round-trip. Copies the snapshot. Does not start powershell.exe."""
+    _touch_metrics_client()
+    snap = _copy_snapshot()
+    system_specs = _specs_from_cache(snap)
     return {
-        "cpu_usage": cpu_usage,
-        "memory_usage": memory_usage,
+        "cpu_usage": snap["cpu_usage"],
+        "memory_usage": snap["memory_usage"],
         "system_specs": system_specs,
-        "gpu_usage": gpu_usage,
+        "gpu_usage": snap["gpu_usage"],
     }
 
 
