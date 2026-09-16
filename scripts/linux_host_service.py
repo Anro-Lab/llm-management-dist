@@ -42,7 +42,7 @@ except ImportError:
     sys.exit(1)
 
 # Host-service version. Not required to match the llm-management image.
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 app = FastAPI(
     title="Linux Host System Info Service",
