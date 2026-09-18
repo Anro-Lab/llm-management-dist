@@ -34,7 +34,7 @@ except ImportError:
     sys.exit(1)
 
 # Host-service version. Not required to match the llm-management image.
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 
 app = FastAPI(
     title="Windows Host System Info Service",
