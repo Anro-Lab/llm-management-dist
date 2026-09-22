@@ -34,7 +34,7 @@ except ImportError:
     sys.exit(1)
 
 # Host-service version. Not required to match the llm-management image.
-__version__ = "1.0.9"
+__version__ = "1.0.10"
 
 app = FastAPI(
     title="Windows Host System Info Service",
@@ -375,6 +375,78 @@ def _sample_disk() -> Dict[str, float]:
     }
 
 
+def _nvidia_smi_rows() -> List[Dict[str, Any]]:
+    """CLI overlay for NVIDIA util/VRAM. PDH GPU Engine % is often 0 under CUDA on laptops."""
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=3,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            rows.append(
+                {
+                    "name": parts[0],
+                    "utilization": _clamp_percent(float(parts[1])),
+                    "memory_used_mb": float(parts[2]),
+                    "memory_total_mb": float(parts[3]),
+                }
+            )
+        except ValueError:
+            continue
+    return rows
+
+
+def _is_nvidia_gpu_row(row: Dict[str, Any]) -> bool:
+    vendor = str(row.get("vendor") or "").lower()
+    name = str(row.get("name") or "").lower()
+    if vendor == "nvidia":
+        return True
+    return any(x in name for x in ("nvidia", "geforce", "rtx", "gtx", "quadro", "tesla"))
+
+
+def _overlay_nvidia_smi(rows: List[Dict[str, Any]]) -> None:
+    """Prefer nvidia-smi util/VRAM for NVIDIA adapters when PDH under-reports."""
+    smi = _nvidia_smi_rows()
+    if not smi:
+        return
+    targets = [r for r in rows if _is_nvidia_gpu_row(r)]
+    if not targets:
+        return
+    remaining = list(smi)
+    for row in targets:
+        name = str(row.get("name") or "").lower()
+        pick = None
+        for i, candidate in enumerate(remaining):
+            sn = str(candidate.get("name") or "").lower()
+            if sn == name or sn in name or name in sn:
+                pick = remaining.pop(i)
+                break
+        if pick is None and len(targets) == 1 and len(remaining) == 1:
+            pick = remaining.pop(0)
+        elif pick is None and remaining:
+            pick = remaining.pop(0)
+        if not pick:
+            continue
+        row["utilization"] = float(pick["utilization"])
+        if pick["memory_used_mb"] > 0:
+            row["memory_used_mb"] = float(pick["memory_used_mb"])
+        if pick["memory_total_mb"] > 0:
+            row["memory_total_mb"] = float(pick["memory_total_mb"])
+
+
 def _join_gpu_usage(identity_gpus: List[Dict[str, Any]], samples: List[Tuple[str, str, float]]) -> Dict[str, Any]:
     """Match PDH samples to cached identity. No CIM. Utilization is always a number."""
     util_map: Dict[str, float] = {}
@@ -489,6 +561,7 @@ def _join_gpu_usage(identity_gpus: List[Dict[str, Any]], samples: List[Tuple[str
                     "adapter_index": key,
                 }
             )
+    _overlay_nvidia_smi(rows)
     return {"gpus": rows}
 
 
